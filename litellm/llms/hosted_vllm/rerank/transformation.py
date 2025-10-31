@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
+from litellm._logging import verbose_router_logger
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -143,6 +144,7 @@ class HostedVLLMRerankConfig(BaseRerankConfig):
         """
         Process response from Hosted VLLM rerank API
         """
+        verbose_router_logger.warning(f'😂😂😂 {raw_response.json() = }')
         try:
             raw_response_json = raw_response.json()
         except Exception:
@@ -158,6 +160,7 @@ class HostedVLLMRerankConfig(BaseRerankConfig):
         return HostedVLLMRerankError(message=error_message, status_code=status_code, headers=headers)
 
     def _transform_response(self, response: dict) -> RerankResponse:
+        verbose_router_logger.warning(f'😍😍😍 _transform_response, {response = }')
         # Extract usage information
         usage_data = response.get("usage", {})
         _billed_units = RerankBilledUnits(total_tokens=usage_data.get("total_tokens", 0))
