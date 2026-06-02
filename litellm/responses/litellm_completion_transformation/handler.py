@@ -21,7 +21,6 @@ from litellm.types.utils import ModelResponse
 
 
 class LiteLLMCompletionTransformationHandler:
-
     def response_api_handler(
         self,
         model: str,
@@ -66,8 +65,7 @@ class LiteLLMCompletionTransformationHandler:
         litellm_completion_response: Union[
             ModelResponse, litellm.CustomStreamWrapper
         ] = litellm.completion(
-            **litellm_completion_request,
-            **kwargs,
+            **completion_args,
         )
 
         if isinstance(litellm_completion_response, ModelResponse):
@@ -90,6 +88,9 @@ class LiteLLMCompletionTransformationHandler:
                 custom_llm_provider=custom_llm_provider,
                 litellm_metadata=kwargs.get("litellm_metadata", {}),
             )
+        raise ValueError(
+            f"Unexpected response type: {type(litellm_completion_response)}"
+        )
 
     async def async_response_api_handler(
         self,
@@ -98,7 +99,6 @@ class LiteLLMCompletionTransformationHandler:
         responses_api_request: ResponsesAPIOptionalRequestParams,
         **kwargs,
     ) -> Union[ResponsesAPIResponse, BaseResponsesAPIStreamingIterator]:
-
         previous_response_id: Optional[str] = responses_api_request.get(
             "previous_response_id"
         )
@@ -140,3 +140,6 @@ class LiteLLMCompletionTransformationHandler:
                 ),
                 litellm_metadata=kwargs.get("litellm_metadata", {}),
             )
+        raise ValueError(
+            f"Unexpected response type: {type(litellm_completion_response)}"
+        )

@@ -6,7 +6,9 @@ import TextArea from "antd/es/input/TextArea";
 import { InfoCircleOutlined } from "@ant-design/icons";
 import { Team } from "../key_team_helpers/key_list";
 import CacheControlSettings from "./cache_control_settings";
+import VectorStoreSelector from "../vector_store_management/VectorStoreSelector";
 import { Tag } from "../tag_management/types";
+import { formItemValidateJSON } from "../../utils/textUtils";
 const { Link } = Typography;
 
 interface AdvancedSettingsProps {
@@ -15,6 +17,7 @@ interface AdvancedSettingsProps {
   teams?: Team[] | null;
   guardrailsList: string[];
   tagsList: Record<string, Tag>;
+  accessToken: string;
 }
 
 const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
@@ -23,6 +26,7 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
   teams,
   guardrailsList,
   tagsList,
+  accessToken,
 }) => {
   const [form] = Form.useForm();
   const [customPricing, setCustomPricing] = React.useState(false);
@@ -40,18 +44,6 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
     return Promise.resolve();
   };
 
-  const validateJSON = (_: any, value: string) => {
-    if (!value) {
-      return Promise.resolve();
-    }
-    try {
-      JSON.parse(value);
-      return Promise.resolve();
-    } catch (error) {
-      return Promise.reject("Please enter valid JSON");
-    }
-  };
-
   // Handle custom pricing changes
   const handleCustomPricingChange = (checked: boolean) => {
     setCustomPricing(checked);
@@ -60,6 +52,8 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
       form.setFieldsValue({
         input_cost_per_token: undefined,
         output_cost_per_token: undefined,
+        cache_read_input_token_cost: undefined,
+        cache_creation_input_token_cost: undefined,
         input_cost_per_second: undefined,
       });
     }
@@ -118,6 +112,33 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
           <div className="bg-white rounded-lg">
             <Form.Item label="Custom Pricing" name="custom_pricing" valuePropName="checked" className="mb-4">
               <Switch onChange={handleCustomPricingChange} className="bg-gray-600" />
+            </Form.Item>
+
+            <Form.Item
+              label={
+                <span>
+                  Attached Knowledge Bases (RAG){" "}
+                  <Tooltip title="Vector stores to use for RAG. Every request to this model will automatically retrieve context from these knowledge bases.">
+                    <a
+                      href="https://docs.litellm.ai/docs/completion/knowledgebase"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <InfoCircleOutlined style={{ marginLeft: "4px" }} />
+                    </a>
+                  </Tooltip>
+                </span>
+              }
+              name="vector_store_ids"
+              className="mt-4"
+              help="Select vector stores to attach. Requests to this model will automatically use these for RAG. Set up vector stores in Tools > Vector Stores."
+            >
+              <VectorStoreSelector
+                onChange={() => {}}
+                accessToken={accessToken}
+                placeholder="Select knowledge bases (optional)"
+              />
             </Form.Item>
 
             <Form.Item
@@ -192,6 +213,24 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
                     >
                       <TextInput />
                     </Form.Item>
+                    <Form.Item
+                      label="Cache Read Cost (per 1M tokens)"
+                      name="cache_read_input_token_cost"
+                      rules={[{ validator: validateNumber }]}
+                      tooltip="If left blank, defaults to Input Cost."
+                      className="mb-4"
+                    >
+                      <TextInput placeholder="Defaults to Input Cost if blank" />
+                    </Form.Item>
+                    <Form.Item
+                      label="Cache Write Cost (per 1M tokens)"
+                      name="cache_creation_input_token_cost"
+                      rules={[{ validator: validateNumber }]}
+                      tooltip="If left blank, defaults to Input Cost (the backend falls back to input_cost_per_token when no cache-write rate is set)."
+                      className="mb-4"
+                    >
+                      <TextInput placeholder="Defaults to Input Cost if blank" />
+                    </Form.Item>
                   </>
                 ) : (
                   <Form.Item
@@ -233,7 +272,7 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
               name="litellm_extra_params"
               tooltip="Optional litellm params used for making a litellm.completion() call."
               className="mb-4 mt-4"
-              rules={[{ validator: validateJSON }]}
+              rules={[{ validator: formItemValidateJSON }]}
             >
               <TextArea
                 rows={4}
@@ -260,7 +299,7 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({
               name="model_info_params"
               tooltip="Optional model info params. Returned when calling `/model/info` endpoint."
               className="mb-0"
-              rules={[{ validator: validateJSON }]}
+              rules={[{ validator: formItemValidateJSON }]}
             >
               <TextArea
                 rows={4}

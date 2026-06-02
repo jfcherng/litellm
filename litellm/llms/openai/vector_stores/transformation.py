@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 import httpx
 
 import litellm
+from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.base_llm.vector_store.transformation import BaseVectorStoreConfig
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.router import GenericLiteLLMParams
@@ -106,8 +107,12 @@ class OpenAIVectorStoreConfig(BaseVectorStoreConfig):
         api_base: str,
         litellm_logging_obj: LiteLLMLoggingObj,
         litellm_params: dict,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict]:
-        url = f"{api_base}/{vector_store_id}/search"
+        encoded_vector_store_id = encode_url_path_segment(
+            vector_store_id, field_name="vector_store_id"
+        )
+        url = f"{api_base}/{encoded_vector_store_id}/search"
         typed_request_body = VectorStoreSearchRequest(
             query=query,
             filters=vector_store_search_optional_params.get("filters", None),
@@ -145,6 +150,8 @@ class OpenAIVectorStoreConfig(BaseVectorStoreConfig):
     ) -> Tuple[str, Dict]:
         url = api_base  # Base URL for creating vector stores
         metadata = vector_store_create_optional_params.get("metadata", None)
+        metadata_payload = add_openai_metadata(metadata)
+
         typed_request_body = VectorStoreCreateRequest(
             name=vector_store_create_optional_params.get("name", None),
             file_ids=vector_store_create_optional_params.get("file_ids", None),
@@ -154,7 +161,7 @@ class OpenAIVectorStoreConfig(BaseVectorStoreConfig):
             chunking_strategy=vector_store_create_optional_params.get(
                 "chunking_strategy", None
             ),
-            metadata=add_openai_metadata(metadata) if metadata is not None else None,
+            metadata=metadata_payload,
         )
 
         dict_request_body = cast(dict, typed_request_body)

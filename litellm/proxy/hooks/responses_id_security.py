@@ -173,13 +173,37 @@ class ResponsesIDSecurity(CustomLogger):
                 return response_id, None, None
         return response_id, None, None
 
+    def _get_signing_key(self) -> Optional[str]:
+        """Get the signing key for encryption/decryption."""
+        import os
+
+        from litellm.proxy.proxy_server import master_key
+
+        salt_key = os.getenv("LITELLM_SALT_KEY", None)
+        if salt_key is None:
+            salt_key = master_key
+        return salt_key
+
     def _encrypt_response_id(
         self,
         response: BaseLiteLLMOpenAIResponseObject,
         user_api_key_dict: "UserAPIKeyAuth",
+        request_cache: Optional[dict[str, str]] = None,
     ) -> BaseLiteLLMOpenAIResponseObject:
         # encrypt the response id using the symmetric key
         # encrypt the response id, and encode the user id and response id in base64
+
+        # Check if signing key is available
+        signing_key = self._get_signing_key()
+        if signing_key is None:
+            verbose_proxy_logger.debug(
+                "Response ID encryption is enabled but no signing key is configured. "
+                "Please set LITELLM_SALT_KEY environment variable or configure a master_key. "
+                "Skipping response ID encryption. "
+                "See: https://docs.litellm.ai/docs/proxy/prod#5-set-litellm-salt-key"
+            )
+            return response
+
         response_id = getattr(response, "id", None)
         response_obj = getattr(response, "response", None)
 
@@ -188,31 +212,41 @@ class ResponsesIDSecurity(CustomLogger):
             and isinstance(response_id, str)
             and response_id.startswith("resp_")
         ):
-            encrypted_response_id = SpecialEnums.LITELLM_MANAGED_RESPONSE_API_RESPONSE_ID_COMPLETE_STR.value.format(
-                response_id,
-                user_api_key_dict.user_id or "",
-                user_api_key_dict.team_id or "",
-            )
+            # Check request-scoped cache first (for streaming consistency)
+            if request_cache is not None and response_id in request_cache:
+                setattr(response, "id", request_cache[response_id])
+            else:
+                encrypted_response_id = SpecialEnums.LITELLM_MANAGED_RESPONSE_API_RESPONSE_ID_COMPLETE_STR.value.format(
+                    response_id,
+                    user_api_key_dict.user_id or "",
+                    user_api_key_dict.team_id or "",
+                )
 
-            encoded_user_id_and_response_id = encrypt_value_helper(
-                value=encrypted_response_id
-            )
-            setattr(
-                response, "id", f"resp_{encoded_user_id_and_response_id}"
-            )  # maintain the 'resp_' prefix for the responses api response id
+                encoded_user_id_and_response_id = encrypt_value_helper(
+                    value=encrypted_response_id
+                )
+                encrypted_id = f"resp_{encoded_user_id_and_response_id}"
+                if request_cache is not None:
+                    request_cache[response_id] = encrypted_id
+                setattr(response, "id", encrypted_id)
 
         elif response_obj and isinstance(response_obj, ResponsesAPIResponse):
-            encrypted_response_id = SpecialEnums.LITELLM_MANAGED_RESPONSE_API_RESPONSE_ID_COMPLETE_STR.value.format(
-                response_obj.id,
-                user_api_key_dict.user_id or "",
-                user_api_key_dict.team_id or "",
-            )
-            encoded_user_id_and_response_id = encrypt_value_helper(
-                value=encrypted_response_id
-            )
-            setattr(
-                response_obj, "id", f"resp_{encoded_user_id_and_response_id}"
-            )  # maintain the 'resp_' prefix for the responses api response id
+            # Check request-scoped cache first (for streaming consistency)
+            if request_cache is not None and response_obj.id in request_cache:
+                setattr(response_obj, "id", request_cache[response_obj.id])
+            else:
+                encrypted_response_id = SpecialEnums.LITELLM_MANAGED_RESPONSE_API_RESPONSE_ID_COMPLETE_STR.value.format(
+                    response_obj.id,
+                    user_api_key_dict.user_id or "",
+                    user_api_key_dict.team_id or "",
+                )
+                encoded_user_id_and_response_id = encrypt_value_helper(
+                    value=encrypted_response_id
+                )
+                encrypted_id = f"resp_{encoded_user_id_and_response_id}"
+                if request_cache is not None:
+                    request_cache[response_obj.id] = encrypted_id
+                setattr(response_obj, "id", encrypted_id)
             setattr(response, "response", response_obj)
         return response
 
@@ -235,7 +269,9 @@ class ResponsesIDSecurity(CustomLogger):
         if isinstance(response, ResponsesAPIResponse):
             response = cast(
                 ResponsesAPIResponse,
-                self._encrypt_response_id(response, user_api_key_dict),
+                self._encrypt_response_id(
+                    response, user_api_key_dict, request_cache=None
+                ),
             )
         return response
 
@@ -244,6 +280,9 @@ class ResponsesIDSecurity(CustomLogger):
     ) -> AsyncGenerator[BaseLiteLLMOpenAIResponseObject, None]:
         from litellm.proxy.proxy_server import general_settings
 
+        # Create a request-scoped cache for consistent encryption across streaming chunks.
+        request_encryption_cache: dict[str, str] = {}
+
         async for chunk in response:
             if (
                 isinstance(chunk, BaseLiteLLMOpenAIResponseObject)
@@ -251,5 +290,7 @@ class ResponsesIDSecurity(CustomLogger):
                 == "/v1/responses"  # only encrypt the response id for the responses api
                 and not general_settings.get("disable_responses_id_security", False)
             ):
-                chunk = self._encrypt_response_id(chunk, user_api_key_dict)
+                chunk = self._encrypt_response_id(
+                    chunk, user_api_key_dict, request_encryption_cache
+                )
             yield chunk

@@ -39,11 +39,13 @@ class PartnerModelPrefixes(str, Enum):
     QWEN_PREFIX = "qwen"
     GPT_OSS_PREFIX = "openai/gpt-oss-"
     MINIMAX_PREFIX = "minimaxai/"
+    MOONSHOT_PREFIX = "moonshotai/"
+    ZAI_PREFIX = "zai-org/"
 
 
 class VertexAIPartnerModels(VertexBase):
     def __init__(self) -> None:
-        pass
+        super().__init__()
 
     @staticmethod
     def is_vertex_partner_model(model: str):
@@ -64,6 +66,8 @@ class VertexAIPartnerModels(VertexBase):
             or model.startswith(PartnerModelPrefixes.QWEN_PREFIX)
             or model.startswith(PartnerModelPrefixes.GPT_OSS_PREFIX)
             or model.startswith(PartnerModelPrefixes.MINIMAX_PREFIX)
+            or model.startswith(PartnerModelPrefixes.MOONSHOT_PREFIX)
+            or model.startswith(PartnerModelPrefixes.ZAI_PREFIX)
         ):
             return True
         return False
@@ -76,6 +80,8 @@ class VertexAIPartnerModels(VertexBase):
             PartnerModelPrefixes.QWEN_PREFIX,
             PartnerModelPrefixes.GPT_OSS_PREFIX,
             PartnerModelPrefixes.MINIMAX_PREFIX,
+            PartnerModelPrefixes.MOONSHOT_PREFIX,
+            PartnerModelPrefixes.ZAI_PREFIX,
         ]
         if any(provider in model for provider in OPENAI_LIKE_VERTEX_PROVIDERS):
             return True
@@ -110,9 +116,6 @@ class VertexAIPartnerModels(VertexBase):
                 CodestralTextCompletion,
             )
             from litellm.llms.openai_like.chat.handler import OpenAILikeChatHandler
-            from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
-                VertexLLM,
-            )
         except Exception as e:
             raise VertexAIError(
                 status_code=400,
@@ -127,9 +130,7 @@ class VertexAIPartnerModels(VertexBase):
                 message="""Upgrade vertex ai. Run `pip install "google-cloud-aiplatform>=1.38"`""",
             )
         try:
-            vertex_httpx_logic = VertexLLM()
-
-            access_token, project_id = vertex_httpx_logic._ensure_access_token(
+            access_token, project_id = self._ensure_access_token(
                 credentials=vertex_credentials,
                 project_id=vertex_project,
                 custom_llm_provider="vertex_ai",
@@ -286,22 +287,15 @@ class VertexAIPartnerModels(VertexBase):
         Returns:
             Dict containing token count information
         """
-        try:
-            import vertexai
-        except Exception as e:
-            raise VertexAIError(
-                status_code=400,
-                message=f"""vertexai import failed please run `pip install -U "google-cloud-aiplatform>=1.38"`. Got error: {e}""",
-            )
-
-        if not (
-            hasattr(vertexai, "preview") or hasattr(vertexai.preview, "language_models")
-        ):
-            raise VertexAIError(
-                status_code=400,
-                message="""Upgrade vertex ai. Run `pip install "google-cloud-aiplatform>=1.38"`""",
-            )
-
+        # Note: we intentionally do not import `vertexai` (the Gemini SDK shipped
+        # by `google-cloud-aiplatform`) on this path. Partner models such as
+        # Claude on Vertex use the Anthropic Messages API protocol directly via
+        # `:rawPredict`, and `VertexAIPartnerModelsTokenCounter` reaches that
+        # endpoint with an authenticated httpx client — it never touches the
+        # Gemini SDK. Requiring `google-cloud-aiplatform>=1.38` here turned a
+        # SDK-free Anthropic-protocol call into a hard dependency on the Gemini
+        # SDK (see #28084), breaking `/v1/messages/count_tokens` for Claude-on-
+        # Vertex on any LiteLLM install without that extra. Stay SDK-free.
         try:
             from litellm.llms.vertex_ai.vertex_ai_partner_models.count_tokens.handler import (
                 VertexAIPartnerModelsTokenCounter,

@@ -11,6 +11,7 @@ def get_supported_openai_params(  # noqa: PLR0915
     request_type: Literal[
         "chat_completion", "embeddings", "transcription"
     ] = "chat_completion",
+    base_model: Optional[str] = None,
 ) -> Optional[list]:
     """
     Returns the supported openai params for a given model + provider
@@ -19,6 +20,11 @@ def get_supported_openai_params(  # noqa: PLR0915
     ```
     get_supported_openai_params(model="anthropic.claude-3", custom_llm_provider="bedrock")
     ```
+
+    Args:
+        base_model: For Azure, the true underlying model (e.g. ``"azure/gpt-5.2"``)
+            when the deployment name differs. Used for model-type detection so that
+            non-standard deployment names route to the correct config.
 
     Returns:
     - List if custom_llm_provider is mapped
@@ -32,17 +38,21 @@ def get_supported_openai_params(  # noqa: PLR0915
 
     if custom_llm_provider in LlmProvidersSet:
         provider_config = litellm.ProviderConfigManager.get_provider_chat_config(
-            model=model, provider=LlmProviders(custom_llm_provider)
+            model=model,
+            provider=LlmProviders(custom_llm_provider),
+            base_model=base_model,
         )
     elif custom_llm_provider.split("/")[0] in LlmProvidersSet:
         provider_config = litellm.ProviderConfigManager.get_provider_chat_config(
-            model=model, provider=LlmProviders(custom_llm_provider.split("/")[0])
+            model=model,
+            provider=LlmProviders(custom_llm_provider.split("/")[0]),
+            base_model=base_model,
         )
     else:
         provider_config = None
 
     if provider_config and request_type == "chat_completion":
-        return provider_config.get_supported_openai_params(model=model)
+        return provider_config.get_supported_openai_params(model=base_model or model)
 
     if custom_llm_provider == "bedrock":
         return litellm.AmazonConverseConfig().get_supported_openai_params(model=model)
@@ -88,6 +98,10 @@ def get_supported_openai_params(  # noqa: PLR0915
         return litellm.VolcEngineConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "groq":
         return litellm.GroqChatConfig().get_supported_openai_params(model=model)
+    elif custom_llm_provider == "bedrock_mantle":
+        return litellm.BedrockMantleChatConfig().get_supported_openai_params(
+            model=model
+        )
     elif custom_llm_provider == "hosted_vllm":
         return litellm.HostedVLLMChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "vllm":
@@ -116,17 +130,33 @@ def get_supported_openai_params(  # noqa: PLR0915
                     f"Unsupported provider config: {transcription_provider_config} for model: {model}"
                 )
         return litellm.OpenAIConfig().get_supported_openai_params(model=model)
-    elif custom_llm_provider == "azure":
-        if litellm.AzureOpenAIO1Config().is_o_series_model(model=model):
-            return litellm.AzureOpenAIO1Config().get_supported_openai_params(
+    elif custom_llm_provider == "sap":
+        if request_type == "chat_completion":
+            return litellm.GenAIHubOrchestrationConfig().get_supported_openai_params(
                 model=model
             )
-        elif litellm.AzureOpenAIGPT5Config.is_model_gpt_5_model(model=model):
-            return litellm.AzureOpenAIGPT5Config().get_supported_openai_params(
+        elif request_type == "embeddings":
+            return litellm.GenAIHubEmbeddingConfig().get_supported_openai_params(
                 model=model
+            )
+    elif custom_llm_provider == "azure":
+        _azure_detection_model = base_model or model
+        if litellm.AzureOpenAIO1Config().is_o_series_model(
+            model=_azure_detection_model
+        ):
+            return litellm.AzureOpenAIO1Config().get_supported_openai_params(
+                model=_azure_detection_model
+            )
+        elif litellm.AzureOpenAIGPT5Config.is_model_gpt_5_model(
+            model=_azure_detection_model
+        ):
+            return litellm.AzureOpenAIGPT5Config().get_supported_openai_params(
+                model=_azure_detection_model
             )
         else:
-            return litellm.AzureOpenAIConfig().get_supported_openai_params(model=model)
+            return litellm.AzureOpenAIConfig().get_supported_openai_params(
+                model=_azure_detection_model
+            )
     elif custom_llm_provider == "openrouter":
         return litellm.OpenrouterConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "vercel_ai_gateway":
@@ -137,6 +167,14 @@ def get_supported_openai_params(  # noqa: PLR0915
             return litellm.MistralConfig().get_supported_openai_params(model=model)
         elif request_type == "embeddings":
             return litellm.MistralEmbeddingConfig().get_supported_openai_params()
+        elif request_type == "transcription":
+            from litellm.llms.mistral.audio_transcription.transformation import (
+                MistralAudioTranscriptionConfig,
+            )
+
+            return MistralAudioTranscriptionConfig().get_supported_openai_params(
+                model=model
+            )
     elif custom_llm_provider == "text-completion-codestral":
         return litellm.CodestralTextCompletionConfig().get_supported_openai_params(
             model=model
@@ -265,6 +303,24 @@ def get_supported_openai_params(  # noqa: PLR0915
                 litellm.DeepgramAudioTranscriptionConfig().get_supported_openai_params(
                     model=model
                 )
+            )
+    elif custom_llm_provider == "ovhcloud":
+        if request_type == "transcription":
+            from litellm.llms.ovhcloud.audio_transcription.transformation import (
+                OVHCloudAudioTranscriptionConfig,
+            )
+
+            return OVHCloudAudioTranscriptionConfig().get_supported_openai_params(
+                model=model
+            )
+    elif custom_llm_provider == "scaleway":
+        if request_type == "transcription":
+            from litellm.llms.scaleway.audio_transcription.transformation import (
+                ScalewayAudioTranscriptionConfig,
+            )
+
+            return ScalewayAudioTranscriptionConfig().get_supported_openai_params(
+                model=model
             )
     elif custom_llm_provider == "elevenlabs":
         if request_type == "transcription":

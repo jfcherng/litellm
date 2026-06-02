@@ -4,6 +4,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, cast
 import httpx
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm._uuid import uuid
 from litellm.constants import RESPONSE_FORMAT_TOOL_NAME
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -25,7 +26,12 @@ from litellm.types.utils import (
     ModelResponse,
     ProviderSpecificModelInfo,
 )
-from litellm.utils import supports_function_calling, supports_tool_choice
+from litellm.utils import (
+    get_model_cost_mutation_generation,
+    supports_function_calling,
+    supports_reasoning,
+    supports_tool_choice,
+)
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..common_utils import FireworksAIException
@@ -51,6 +57,7 @@ class FireworksAIConfig(OpenAIGPTConfig):
     response_format: Optional[dict] = None
     user: Optional[str] = None
     logprobs: Optional[int] = None
+    reasoning_effort: Optional[str] = None
 
     # Non OpenAI parameters - Fireworks AI only params
     prompt_truncate_length: Optional[int] = None
@@ -71,6 +78,7 @@ class FireworksAIConfig(OpenAIGPTConfig):
         response_format: Optional[dict] = None,
         user: Optional[str] = None,
         logprobs: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         prompt_truncate_length: Optional[int] = None,
         context_length_exceeded_behavior: Optional[Literal["error", "truncate"]] = None,
     ) -> None:
@@ -106,10 +114,27 @@ class FireworksAIConfig(OpenAIGPTConfig):
         # Only add tools for models that support function calling
         if supports_function_calling(model=model, custom_llm_provider="fireworks_ai"):
             supported_params.append("tools")
+            supported_params.append("parallel_tool_calls")
+        else:
+            # Historically every Fireworks model advertised tool support, so a
+            # JSON entry that flips `supports_function_calling` to false will
+            # silently drop `tools` from requests. Surface this so users can
+            # tell why their tool calls suddenly stop working.
+            verbose_logger.debug(
+                "fireworks_ai model %r is marked as not supporting "
+                "function calling in model_prices_and_context_window.json; "
+                "`tools` and `parallel_tool_calls` will be dropped from the "
+                "request.",
+                model,
+            )
 
         # Only add tool_choice for models that explicitly support it
         if supports_tool_choice(model=model, custom_llm_provider="fireworks_ai"):
             supported_params.append("tool_choice")
+
+        # Only add reasoning_effort for models that support it
+        if supports_reasoning(model=model, custom_llm_provider="fireworks_ai"):
+            supported_params.append("reasoning_effort")
 
         return supported_params
 
@@ -175,11 +200,16 @@ class FireworksAIConfig(OpenAIGPTConfig):
         ):  # allow user to toggle this feature.
             return content
         if isinstance(content["image_url"], str):
-            content["image_url"] = f"{content['image_url']}#transform=inline"
+            # Skip base64 data URLs — appending #transform=inline corrupts the
+            # base64 payload and causes an "Incorrect padding" decode error on
+            # the Fireworks side.  Data URLs are already inlined by definition.
+            # Lower-case before checking: URI schemes are case-insensitive (RFC 3986).
+            if not content["image_url"].lower().startswith("data:"):
+                content["image_url"] = f"{content['image_url']}#transform=inline"
         elif isinstance(content["image_url"], dict):
-            content["image_url"][
-                "url"
-            ] = f"{content['image_url']['url']}#transform=inline"
+            url = content["image_url"]["url"]
+            if not url.lower().startswith("data:"):
+                content["image_url"]["url"] = f"{url}#transform=inline"
         return content
 
     def _transform_tools(
@@ -226,16 +256,130 @@ class FireworksAIConfig(OpenAIGPTConfig):
                                 disable_add_transform_inline_image_block=disable_add_transform_inline_image_block,
                             )
             filter_value_from_dict(cast(dict, message), "cache_control")
+            # Remove fields not permitted by FireworksAI (additionalProperties: false
+            # on their ChatMessage schema) that may cause:
+            # "Extra inputs are not permitted, field: 'messages[n].<field>'"
+            if isinstance(message, dict):
+                m = cast(dict, message)
+                m.pop("provider_specific_fields", None)
+                m.pop("thinking_blocks", None)
 
         return messages
 
+    # Cached index of fireworks_ai/* entries from litellm.model_cost. Building
+    # this index requires a full scan of model_cost (tens of thousands of
+    # entries), so we memoize it. The cache key is (id(model_cost),
+    # mutation_generation): the generation counter is bumped on every
+    # register_model / reload path, so add+remove or in-place value
+    # replacement (which can leave id and len unchanged) still invalidates.
+    _fireworks_index_cache: Optional[Tuple[int, int, List[Tuple[str, dict]]]] = None
+
+    @classmethod
+    def _get_fireworks_index(cls) -> List[Tuple[str, dict]]:
+        model_cost = litellm.model_cost
+        signature = (id(model_cost), get_model_cost_mutation_generation())
+        cached = cls._fireworks_index_cache
+        if (
+            cached is not None
+            and cached[0] == signature[0]
+            and cached[1] == signature[1]
+        ):
+            return cached[2]
+
+        index: List[Tuple[str, dict]] = []
+        for key, model_info in model_cost.items():
+            if not key.startswith("fireworks_ai/"):
+                continue
+            if not isinstance(model_info, dict):
+                continue
+            key_short = key[len("fireworks_ai/") :]
+            if key_short.startswith("accounts/fireworks/models/"):
+                key_short = key_short[len("accounts/fireworks/models/") :]
+            if not key_short:
+                continue
+            index.append((key_short, model_info))
+
+        cls._fireworks_index_cache = (signature[0], signature[1], index)
+        return index
+
+    @staticmethod
+    def _matches_on_hyphen_boundary(short_name: str, key_short: str) -> bool:
+        """Return True if `key_short` appears in `short_name` aligned to
+        hyphen-separated word boundaries (or end-of-string). This avoids
+        spurious substring matches like `"some-model"` matching
+        `"awesome-model"`."""
+        if short_name == key_short:
+            return True
+        if short_name.startswith(key_short + "-"):
+            return True
+        if short_name.endswith("-" + key_short):
+            return True
+        return ("-" + key_short + "-") in short_name
+
+    def _get_model_cost_capability(self, model: str, capability: str) -> Optional[bool]:
+        short_name = model
+        if short_name.startswith("fireworks_ai/"):
+            short_name = short_name[len("fireworks_ai/") :]
+        if short_name.startswith("accounts/fireworks/models/"):
+            short_name = short_name[len("accounts/fireworks/models/") :]
+
+        candidate_keys = [
+            model,
+            f"fireworks_ai/{short_name}",
+            f"fireworks_ai/accounts/fireworks/models/{short_name}",
+        ]
+
+        for candidate_key in candidate_keys:
+            model_info = litellm.model_cost.get(candidate_key)
+            if model_info is not None and model_info.get(capability) is not None:
+                return cast(Optional[bool], model_info.get(capability))
+
+        # Fallback: preserve historical substring matching for model name
+        # variants (e.g. fine-tuned or regionally-suffixed versions of a
+        # known model). Pick the *longest* matching entry so a more specific
+        # known model (e.g. "qwen3-8b-instruct") wins over a less specific
+        # one (e.g. "qwen3-8b") when the query model is more specific still.
+        # Use hyphen-aligned matching to avoid false positives where a short
+        # known model name is an unrelated substring of a longer one.
+        best_match_short: Optional[str] = None
+        best_match_value: Optional[bool] = None
+        for key_short, model_info in self._get_fireworks_index():
+            if model_info.get(capability) is None:
+                continue
+            if not self._matches_on_hyphen_boundary(short_name, key_short):
+                continue
+            if best_match_short is None or len(key_short) > len(best_match_short):
+                best_match_short = key_short
+                best_match_value = cast(Optional[bool], model_info.get(capability))
+
+        return best_match_value
+
     def get_provider_info(self, model: str) -> ProviderSpecificModelInfo:
-        provider_specific_model_info = ProviderSpecificModelInfo(
-            supports_function_calling=True,
-            supports_prompt_caching=True,  # https://docs.fireworks.ai/guides/prompt-caching
-            supports_pdf_input=True,  # via document inlining
-            supports_vision=True,  # via document inlining
+        supports_function_calling_value = self._get_model_cost_capability(
+            model=model, capability="supports_function_calling"
         )
+        supports_reasoning_value = self._get_model_cost_capability(
+            model=model, capability="supports_reasoning"
+        )
+
+        provider_specific_model_info: ProviderSpecificModelInfo = {
+            "supports_function_calling": True,
+            "supports_prompt_caching": True,  # https://docs.fireworks.ai/guides/prompt-caching
+            "supports_pdf_input": True,  # via document inlining
+            "supports_vision": True,  # via document inlining
+        }
+
+        if supports_function_calling_value is not None:
+            provider_specific_model_info["supports_function_calling"] = (
+                supports_function_calling_value
+            )
+
+        # Only include supports_reasoning if True
+        if supports_reasoning_value:
+            provider_specific_model_info["supports_reasoning"] = (
+                supports_reasoning_value
+            )
+
         return provider_specific_model_info
 
     def transform_request(
@@ -339,11 +483,11 @@ class FireworksAIConfig(OpenAIGPTConfig):
 
         ## FIREWORKS AI sends tool calls in the content field instead of tool_calls
         for choice in response.choices:
-            cast(
-                Choices, choice
-            ).message = self._handle_message_content_with_tool_calls(
-                message=cast(Choices, choice).message,
-                tool_calls=optional_params.get("tools", None),
+            cast(Choices, choice).message = (
+                self._handle_message_content_with_tool_calls(
+                    message=cast(Choices, choice).message,
+                    tool_calls=optional_params.get("tools", None),
+                )
             )
 
         response._hidden_params = {"additional_headers": additional_headers}
@@ -381,8 +525,11 @@ class FireworksAIConfig(OpenAIGPTConfig):
                 "FIREWORKS_ACCOUNT_ID is not set. Please set the environment variable, to query Fireworks AI's `/models` endpoint."
             )
 
+        base = api_base.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
         response = litellm.module_level_client.get(
-            url=f"{api_base}/v1/accounts/{account_id}/models",
+            url=f"{base}/v1/accounts/{account_id}/models",
             headers={"Authorization": f"Bearer {api_key}"},
         )
 

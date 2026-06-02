@@ -1,9 +1,11 @@
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import httpx
 from openai.types.responses import ResponseReasoningItem
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.azure.common_utils import BaseAzureLLM
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.types.llms.openai import *
@@ -20,9 +22,23 @@ else:
 
 
 class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
+    # Parameters not supported by Azure Responses API
+    AZURE_UNSUPPORTED_PARAMS = ["context_management"]
+
     @property
     def custom_llm_provider(self) -> LlmProviders:
         return LlmProviders.AZURE
+
+    def get_supported_openai_params(self, model: str) -> list:
+        """
+        Azure Responses API does not support context_management (compaction).
+        """
+        base_supported_params = super().get_supported_openai_params(model)
+        return [
+            param
+            for param in base_supported_params
+            if param not in self.AZURE_UNSUPPORTED_PARAMS
+        ]
 
     def validate_environment(
         self, headers: dict, model: str, litellm_params: Optional[GenericLiteLLMParams]
@@ -43,7 +59,7 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
         """
         Handle reasoning items to filter out the status field.
         Issue: https://github.com/BerriAI/litellm/issues/13484
-        
+
         Azure OpenAI API does not accept 'status' field in reasoning input items.
         """
         if item.get("type") == "reasoning":
@@ -78,7 +94,7 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 }
                 return filtered_item
         return item
-    
+
     def _validate_input_param(
         self, input: Union[str, ResponseInputParam]
     ) -> Union[str, ResponseInputParam]:
@@ -90,7 +106,7 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
         # First call parent's validation
         validated_input = super()._validate_input_param(input)
-        
+
         # Then filter out status from message items
         if isinstance(validated_input, list):
             filtered_input: List[Any] = []
@@ -102,7 +118,7 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 else:
                     filtered_input.append(item)
             return cast(ResponseInputParam, filtered_input)
-        
+
         return validated_input
 
     def transform_responses_api_request(
@@ -115,6 +131,21 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
     ) -> Dict:
         """No transform applied since inputs are in OpenAI spec already"""
         stripped_model_name = self.get_stripped_model_name(model)
+
+        # Azure Responses API requires flattened tools (params at top level, not nested in 'function')
+        if "tools" in response_api_optional_request_params and isinstance(
+            response_api_optional_request_params["tools"], list
+        ):
+            new_tools: List[Dict[str, Any]] = []
+            for tool in response_api_optional_request_params["tools"]:
+                if isinstance(tool, dict) and "function" in tool:
+                    new_tool: Dict[str, Any] = deepcopy(tool)
+                    function_data = new_tool.pop("function")
+                    new_tool.update(function_data)
+                    new_tools.append(new_tool)
+                else:
+                    new_tools.append(tool)
+            response_api_optional_request_params["tools"] = new_tools
 
         return super().transform_responses_api_request(
             model=stripped_model_name,
@@ -171,7 +202,10 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
         # Insert the response_id at the end of the path component
         # Remove trailing slash if present to avoid double slashes
         path = parsed_url.path.rstrip("/")
-        new_path = f"{path}/{response_id}"
+        encoded_response_id = encode_url_path_segment(
+            response_id, field_name="response_id"
+        )
+        new_path = f"{path}/{encoded_response_id}"
 
         # Reconstruct the URL with all original components but with the modified path
         constructed_url = urlunparse(
@@ -292,7 +326,10 @@ class AzureOpenAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
         # Insert the response_id and /cancel at the end of the path component
         # Remove trailing slash if present to avoid double slashes
         path = parsed_url.path.rstrip("/")
-        new_path = f"{path}/{response_id}/cancel"
+        encoded_response_id = encode_url_path_segment(
+            response_id, field_name="response_id"
+        )
+        new_path = f"{path}/{encoded_response_id}/cancel"
 
         # Reconstruct the URL with all original components but with the modified path
         cancel_url = urlunparse(

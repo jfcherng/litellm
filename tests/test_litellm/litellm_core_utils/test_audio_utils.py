@@ -12,6 +12,7 @@ import pytest
 from litellm.litellm_core_utils.audio_utils.utils import (
     ProcessedAudioFile,
     calculate_request_duration,
+    get_audio_file_content_hash,
     get_audio_file_for_health_check,
     get_audio_file_name,
     process_audio_file,
@@ -41,8 +42,10 @@ class TestProcessAudioFile:
         assert result.filename == "audio.wav"
         assert result.content_type == "audio/wav"
 
-    def test_process_file_path_input(self):
-        """Test processing file path input"""
+    def test_process_pathlib_input(self):
+        """pathlib.Path is a Python-level type HTTP form values can't fabricate."""
+        from pathlib import Path
+
         test_content = b"test audio content"
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
@@ -50,14 +53,21 @@ class TestProcessAudioFile:
             temp_file_path = temp_file.name
 
         try:
-            result = process_audio_file(temp_file_path)
+            result = process_audio_file(Path(temp_file_path))
 
             assert isinstance(result, ProcessedAudioFile)
             assert result.file_content == test_content
             assert result.filename == os.path.basename(temp_file_path)
-            assert result.content_type == "audio/mpeg"  # .mp3 should map to audio/mpeg
+            assert result.content_type == "audio/mpeg"
         finally:
             os.unlink(temp_file_path)
+
+    def test_process_bare_str_path_rejected(self):
+        """Bare str paths are rejected — when this runs in a proxy request
+        handler the value is attacker-controlled, and opening it as a path
+        is an arbitrary local file read."""
+        with pytest.raises(ValueError, match="does not accept bare str inputs"):
+            process_audio_file("/etc/passwd")
 
     def test_process_tuple_input_with_bytes(self):
         """Test processing tuple input with bytes content"""
@@ -72,8 +82,10 @@ class TestProcessAudioFile:
         assert result.filename == filename
         assert result.content_type == "audio/wav"
 
-    def test_process_tuple_input_with_file_path(self):
-        """Test processing tuple input with file path content"""
+    def test_process_tuple_input_with_pathlib_content(self):
+        """Tuple input with pathlib.Path content is allowed; bare str content is not."""
+        from pathlib import Path
+
         test_content = b"test audio content"
 
         with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as temp_file:
@@ -82,7 +94,7 @@ class TestProcessAudioFile:
 
         try:
             filename = "custom_name.flac"
-            audio_tuple = (filename, temp_file_path)
+            audio_tuple = (filename, Path(temp_file_path))
 
             result = process_audio_file(audio_tuple)
 
@@ -263,3 +275,54 @@ class TestCalculateRequestDuration:
         assert file_obj.tell() == len(
             wav_header
         ), "File position should be restored to original position"
+
+
+class TestGetAudioFileContentHash:
+    """Test the get_audio_file_content_hash function for cache key generation"""
+
+    def test_different_content_same_filename_different_hash(self):
+        """Test that different content with same filename produces different hashes"""
+        content1 = b"audio content 1"
+        content2 = b"audio content 2"
+        filename = "test.mp3"
+
+        hash1 = get_audio_file_content_hash((filename, content1))
+        hash2 = get_audio_file_content_hash((filename, content2))
+
+        assert hash1 != hash2, "Different content should produce different hashes"
+
+    def test_same_content_same_hash(self):
+        """Test that same content produces same hash"""
+        content = b"same audio content"
+        filename1 = "test1.mp3"
+        filename2 = "test2.mp3"
+
+        hash1 = get_audio_file_content_hash((filename1, content))
+        hash2 = get_audio_file_content_hash((filename2, content))
+
+        assert (
+            hash1 == hash2
+        ), "Same content should produce same hash regardless of filename"
+
+    def test_bytes_input(self):
+        """Test that raw bytes input works"""
+        content = b"raw bytes content"
+        hash1 = get_audio_file_content_hash(content)
+        hash2 = get_audio_file_content_hash(content)
+
+        assert hash1 == hash2, "Same bytes should produce same hash"
+        assert len(hash1) == 64, "SHA-256 hash should be 64 characters"
+
+    def test_fallback_to_filename(self):
+        """Test that function falls back to filename when content extraction fails"""
+
+        # Use a non-readable object that will trigger fallback
+        class UnreadableFile:
+            def __init__(self, name):
+                self.name = name
+
+        file_obj = UnreadableFile("test.mp3")
+        hash_result = get_audio_file_content_hash(file_obj)
+
+        assert isinstance(hash_result, str)
+        assert len(hash_result) == 64, "Should return valid hash even on fallback"

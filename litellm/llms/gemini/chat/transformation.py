@@ -1,5 +1,7 @@
 from typing import List, Optional, cast
 
+import litellm
+
 from litellm.litellm_core_utils.prompt_templates.factory import (
     convert_generic_image_chunk_to_openai_image_obj,
     convert_to_anthropic_image_obj,
@@ -87,11 +89,13 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
             "stop",
             "logprobs",
             "frequency_penalty",
+            "presence_penalty",
             "modalities",
             "parallel_tool_calls",
             "web_search_options",
+            "service_tier",
         ]
-        if supports_reasoning(model):
+        if supports_reasoning(model, custom_llm_provider="gemini"):
             supported_params.append("reasoning_effort")
             supported_params.append("thinking")
         if self.is_model_gemini_audio_model(model):
@@ -99,7 +103,10 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
         return supported_params
 
     def _transform_messages(
-        self, messages: List[AllMessageValues]
+        self,
+        messages: List[AllMessageValues],
+        model: Optional[str] = None,
+        litellm_params: Optional[dict] = None,
     ) -> List[ContentType]:
         """
         Google AI Studio Gemini does not support HTTP/HTTPS URLs for files.
@@ -114,30 +121,51 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
                         img_element = element
                         _image_url: Optional[str] = None
                         format: Optional[str] = None
+                        detail: Optional[str] = None
                         if isinstance(img_element.get("image_url"), dict):
                             _image_url = img_element["image_url"].get("url")  # type: ignore
                             format = img_element["image_url"].get("format")  # type: ignore
+                            detail = img_element["image_url"].get("detail")  # type: ignore
                         else:
                             _image_url = img_element.get("image_url")  # type: ignore
                         if _image_url and "https://" in _image_url:
                             image_obj = convert_to_anthropic_image_obj(
                                 _image_url, format=format
                             )
-                            img_element["image_url"] = (  # type: ignore
+                            converted_image_url = (
                                 convert_generic_image_chunk_to_openai_image_obj(
                                     image_obj
                                 )
                             )
+                            if detail is not None:
+                                img_element["image_url"] = {  # type: ignore
+                                    "url": converted_image_url,
+                                    "detail": detail,
+                                }
+                            else:
+                                img_element["image_url"] = converted_image_url  # type: ignore
                     elif element.get("type") == "file":
                         file_element = cast(ChatCompletionFileObject, element)
-                        file_id = file_element["file"].get("file_id")
+                        _file_field = file_element.get("file")
+                        if _file_field is None:
+                            raise litellm.BadRequestError(
+                                message="Content block has type='file' but is missing the required 'file' field",
+                                model=model,
+                                llm_provider="gemini",
+                            )
+                        file_id = _file_field.get("file_id")
                         if file_id and ("http://" in file_id or "https://" in file_id):
                             # Convert HTTP/HTTPS file URL to base64 data
                             try:
                                 base64_data = convert_url_to_base64(file_id)
-                                file_element["file"]["file_data"] = base64_data  # type: ignore
-                                file_element["file"].pop("file_id", None)  # type: ignore
+                                _file_field["file_data"] = base64_data  # type: ignore
+                                _file_field.pop("file_id", None)  # type: ignore
                             except Exception:
                                 # If conversion fails, leave as is and let the API handle it
                                 pass
-        return _gemini_convert_messages_with_history(messages=messages)
+        return _gemini_convert_messages_with_history(
+            messages=messages,
+            model=model,
+            litellm_params=litellm_params,
+            custom_llm_provider="gemini",
+        )

@@ -4,11 +4,17 @@ from typing import Dict, List, Optional, Set
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.proxy._types import SpecialModelNames, UserAPIKeyAuth
 from litellm.router import Router
 from litellm.router_utils.fallback_event_handlers import get_fallback_model_group
-from litellm.types.router import LiteLLM_Params
+from litellm.types.router import CredentialLiteLLMParams, LiteLLM_Params
 from litellm.utils import get_valid_models
+
+_CREDENTIAL_LITELLM_PARAM_FIELDS = set(CredentialLiteLLMParams.model_fields)
+
+
+_CREDENTIAL_LITELLM_PARAM_FIELDS = set(CredentialLiteLLMParams.model_fields)
 
 
 def _check_wildcard_routing(model: str) -> bool:
@@ -80,7 +86,6 @@ async def get_mcp_server_ids(
 
     # Make a direct SQL query to get just the mcp_servers
     try:
-
         result = await prisma_client.db.litellm_objectpermissiontable.find_unique(
             where={"object_permission_id": user_api_key_dict.object_permission_id},
         )
@@ -108,15 +113,26 @@ def get_key_models(
     """
     all_models: List[str] = []
     if len(user_api_key_dict.models) > 0:
-        all_models = user_api_key_dict.models
+        all_models = list(
+            user_api_key_dict.models
+        )  # copy to avoid mutating cached objects
         if SpecialModelNames.all_team_models.value in all_models:
-            all_models = user_api_key_dict.team_models
+            all_models = list(
+                user_api_key_dict.team_models
+            )  # copy to avoid mutating cached objects
         if SpecialModelNames.all_proxy_models.value in all_models:
-            all_models = proxy_model_list
+            all_models = list(proxy_model_list)  # copy to avoid mutating caller's list
+            if include_model_access_groups:
+                all_models.extend(model_access_groups.keys())
 
     all_models = _get_models_from_access_groups(
-        model_access_groups=model_access_groups, all_models=all_models
+        model_access_groups=model_access_groups,
+        all_models=all_models,
+        include_model_access_groups=include_model_access_groups,
     )
+
+    # deduplicate while preserving order
+    all_models = list(dict.fromkeys(all_models))
 
     verbose_proxy_logger.debug("ALL KEY MODELS - {}".format(len(all_models)))
     return all_models
@@ -141,14 +157,17 @@ def get_team_models(
             all_models_set.update(team_models)
         if SpecialModelNames.all_proxy_models.value in all_models_set:
             all_models_set.update(proxy_model_list)
-
-    all_models = list(all_models_set)
+            if include_model_access_groups:
+                all_models_set.update(model_access_groups.keys())
 
     all_models = _get_models_from_access_groups(
         model_access_groups=model_access_groups,
         all_models=list(all_models_set),
         include_model_access_groups=include_model_access_groups,
     )
+
+    # deduplicate while preserving order
+    all_models = list(dict.fromkeys(all_models))
 
     verbose_proxy_logger.debug("ALL TEAM MODELS - {}".format(len(all_models)))
     return all_models
@@ -165,6 +184,7 @@ def get_complete_model_list(
     model_access_groups: Dict[str, List[str]] = {},
     include_model_access_groups: Optional[bool] = False,
     only_model_access_groups: Optional[bool] = False,
+    team_id: Optional[str] = None,
 ) -> List[str]:
     """Logic for returning complete model list for a given key + team pair"""
 
@@ -176,6 +196,7 @@ def get_complete_model_list(
     """
 
     unique_models = []
+
     def append_unique(models):
         for model in models:
             if model not in unique_models:
@@ -188,7 +209,7 @@ def get_complete_model_list(
     else:
         append_unique(proxy_model_list)
         if include_model_access_groups:
-            append_unique(list(model_access_groups.keys())) # TODO: keys order
+            append_unique(list(model_access_groups.keys()))  # TODO: keys order
 
         if user_model:
             append_unique([user_model])
@@ -208,11 +229,35 @@ def get_complete_model_list(
         unique_models=unique_models,
         return_wildcard_routes=return_wildcard_routes,
         llm_router=llm_router,
+        team_id=team_id,
     )
 
     complete_model_list = unique_models + all_wildcard_models
 
     return complete_model_list
+
+
+def _hydrate_litellm_credential_name(
+    litellm_params: Optional[LiteLLM_Params],
+) -> Optional[LiteLLM_Params]:
+    if litellm_params is None or litellm_params.litellm_credential_name is None:
+        return litellm_params
+
+    credential_values = CredentialAccessor.get_credential_values(
+        litellm_params.litellm_credential_name
+    )
+    if not credential_values:
+        return litellm_params
+
+    litellm_params = litellm_params.model_copy()
+    for key, value in credential_values.items():
+        if (
+            key in _CREDENTIAL_LITELLM_PARAM_FIELDS
+            and getattr(litellm_params, key, None) is None
+        ):
+            setattr(litellm_params, key, value)
+    litellm_params.litellm_credential_name = None
+    return litellm_params
 
 
 def get_known_models_from_wildcard(
@@ -223,15 +268,17 @@ def get_known_models_from_wildcard(
     except ValueError:  # safely fail
         return []
 
-    if litellm_params is None:  # need litellm params to extract litellm model name
-        return []
-
-    try:
-        provider = litellm_params.model.split("/", 1)[0]
-    except ValueError:
+    # Use provider from litellm_params when available, otherwise from wildcard prefix
+    # (e.g., "openai" from "openai/*" - needed for BYOK where wildcard isn't in router)
+    if litellm_params is not None:
+        try:
+            provider = litellm_params.model.split("/", 1)[0]
+        except ValueError:
+            provider = wildcard_provider_prefix
+    else:
         provider = wildcard_provider_prefix
 
-    # get all known provider models
+    litellm_params = _hydrate_litellm_credential_name(litellm_params)
 
     wildcard_models = get_provider_models(
         provider=provider, litellm_params=litellm_params
@@ -269,6 +316,7 @@ def _get_wildcard_models(
     unique_models: List[str],
     return_wildcard_routes: Optional[bool] = False,
     llm_router: Optional[Router] = None,
+    team_id: Optional[str] = None,
 ) -> List[str]:
     models_to_remove = set()
     all_wildcard_models = []
@@ -281,8 +329,10 @@ def _get_wildcard_models(
 
             ## get litellm params from model
             if llm_router is not None:
-                model_list = llm_router.get_model_list(model_name=model)
-                if model_list is not None:
+                model_list = llm_router.get_model_list(
+                    model_name=model, team_id=team_id
+                )
+                if model_list:
                     for router_model in model_list:
                         wildcard_models = get_known_models_from_wildcard(
                             wildcard_model=model,
@@ -291,11 +341,22 @@ def _get_wildcard_models(
                             ),
                         )
                         all_wildcard_models.extend(wildcard_models)
+                else:
+                    # Router has no deployment for this wildcard (e.g., BYOK team models)
+                    # Fall back to expanding from known provider models
+                    wildcard_models = get_known_models_from_wildcard(
+                        wildcard_model=model, litellm_params=None
+                    )
+                    if wildcard_models:
+                        models_to_remove.add(model)
+                        all_wildcard_models.extend(wildcard_models)
             else:
                 # get all known provider models
-                wildcard_models = get_known_models_from_wildcard(wildcard_model=model)
+                wildcard_models = get_known_models_from_wildcard(
+                    wildcard_model=model, litellm_params=None
+                )
 
-                if wildcard_models is not None:
+                if wildcard_models:
                     models_to_remove.add(model)
                     all_wildcard_models.extend(wildcard_models)
 

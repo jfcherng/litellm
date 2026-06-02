@@ -1,5 +1,5 @@
 """
-Transformation logic from Cohere's /v1/rerank format to Infinity's  `/v1/rerank` format. 
+Transformation logic from Cohere's /v1/rerank format to Infinity's  `/v1/rerank` format.
 
 Why separate file? Make it easy to see how transformation works
 """
@@ -27,8 +27,8 @@ from ..common_utils import InfinityError
 
 class InfinityRerankConfig(CohereRerankConfig):
     def get_complete_url(
-        self, 
-        api_base: Optional[str], 
+        self,
+        api_base: Optional[str],
         model: str,
         optional_params: Optional[dict] = None,
     ) -> str:

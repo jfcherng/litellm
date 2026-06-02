@@ -40,8 +40,14 @@ class ScimTransformations:
         user_updated_at = user.updated_at.isoformat() if user.updated_at else None
 
         emails = []
-        if user.user_email:
+        # Only add email if it's a valid email address (contains @)
+        # user_email can be a UUID when users are created without an email
+        if user.user_email and "@" in user.user_email:
             emails.append(SCIMUserEmail(value=user.user_email, primary=True))
+
+        metadata = user.metadata or {}
+        scim_active = metadata.get("scim_active")
+        active = True if scim_active is None else bool(scim_active)
 
         return SCIMUser(
             schemas=["urn:ietf:params:scim:schemas:core:2.0:User"],
@@ -54,7 +60,7 @@ class ScimTransformations:
             ),
             emails=emails,
             groups=groups,
-            active=True,
+            active=active,
             meta={
                 "resourceType": "User",
                 "created": user_created_at,
@@ -126,7 +132,7 @@ class ScimTransformations:
         for member in team.members_with_roles or []:
             if isinstance(member, dict):
                 member = Member(**member)
-            
+
             scim_members.append(
                 SCIMMember(
                     value=ScimTransformations._get_scim_member_value(member),
@@ -161,7 +167,7 @@ class ScimTransformations:
         elif hasattr(member, "user_id"):
             return member.user_id or ScimTransformations.DEFAULT_SCIM_MEMBER_VALUE
         return ScimTransformations.DEFAULT_SCIM_MEMBER_VALUE
-    
+
     @staticmethod
     def _get_scim_member_display(member: Member) -> str:
         """

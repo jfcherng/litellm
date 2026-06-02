@@ -3,13 +3,19 @@
 import importlib
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Type, cast
+from typing import Any, Dict, List, Literal, Optional, Set, Type, cast
 
 import litellm
+from litellm import Router
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.proxy.guardrails.guardrail_hooks.grayswan import GraySwanGuardrail
+from litellm.proxy.guardrails.guardrail_hooks.grayswan import (
+    initialize_guardrail as initialize_grayswan,
+)
+from litellm.proxy.types_utils.utils import get_instance_fn
 from litellm.proxy.utils import PrismaClient
 from litellm.secret_managers.main import get_secret
 from litellm.types.guardrails import (
@@ -28,6 +34,9 @@ from .guardrail_initializers import (
     initialize_presidio,
     initialize_tool_permission,
 )
+from .guardrail_hooks.llm_as_a_judge import (
+    initialize_guardrail as initialize_llm_as_a_judge,
+)
 
 guardrail_initializer_registry = {
     SupportedGuardrailIntegrations.BEDROCK.value: initialize_bedrock,
@@ -36,9 +45,13 @@ guardrail_initializer_registry = {
     SupportedGuardrailIntegrations.PRESIDIO.value: initialize_presidio,
     SupportedGuardrailIntegrations.HIDE_SECRETS.value: initialize_hide_secrets,
     SupportedGuardrailIntegrations.TOOL_PERMISSION.value: initialize_tool_permission,
+    SupportedGuardrailIntegrations.GRAYSWAN.value: initialize_grayswan,
+    SupportedGuardrailIntegrations.LLM_AS_A_JUDGE.value: initialize_llm_as_a_judge,
 }
 
-guardrail_class_registry: Dict[str, Type[CustomGuardrail]] = {}
+guardrail_class_registry: Dict[str, Type[CustomGuardrail]] = {
+    SupportedGuardrailIntegrations.GRAYSWAN.value: GraySwanGuardrail
+}
 
 
 def get_guardrail_initializer_from_hooks():
@@ -234,10 +247,12 @@ class GuardrailRegistry:
             guardrail_name = guardrail.get("guardrail_name")
             # Properly serialize LitellmParams Pydantic model to dict
             litellm_params_obj: Any = guardrail.get("litellm_params", {})
-            if hasattr(litellm_params_obj, 'model_dump'):
+            if hasattr(litellm_params_obj, "model_dump"):
                 litellm_params_dict = litellm_params_obj.model_dump()
             else:
-                litellm_params_dict = dict(litellm_params_obj) if litellm_params_obj else {}
+                litellm_params_dict = (
+                    dict(litellm_params_obj) if litellm_params_obj else {}
+                )
             litellm_params: str = safe_dumps(litellm_params_dict)
             guardrail_info: str = safe_dumps(guardrail.get("guardrail_info", {}))
 
@@ -286,10 +301,12 @@ class GuardrailRegistry:
             guardrail_name = guardrail.get("guardrail_name")
             # Properly serialize LitellmParams Pydantic model to dict
             litellm_params_obj: Any = guardrail.get("litellm_params", {})
-            if hasattr(litellm_params_obj, 'model_dump'):
+            if hasattr(litellm_params_obj, "model_dump"):
                 litellm_params_dict = litellm_params_obj.model_dump()
             else:
-                litellm_params_dict = dict(litellm_params_obj) if litellm_params_obj else {}
+                litellm_params_dict = (
+                    dict(litellm_params_obj) if litellm_params_obj else {}
+                )
             litellm_params: str = safe_dumps(litellm_params_dict)
             guardrail_info: str = safe_dumps(guardrail.get("guardrail_info", {}))
 
@@ -314,11 +331,13 @@ class GuardrailRegistry:
         prisma_client: PrismaClient,
     ) -> List[Guardrail]:
         """
-        Get all guardrails from the database
+        Get all active guardrails from the database.
+        Only rows with status == "active" are returned (pending_review and rejected are excluded).
         """
         try:
             guardrails_from_db = (
                 await prisma_client.db.litellm_guardrailstable.find_many(
+                    where={"status": "active"},
                     order={"created_at": "desc"},
                 )
             )
@@ -384,10 +403,19 @@ class InMemoryGuardrailHandler:
         Guardrail id to CustomGuardrail object mapping
         """
 
+        self._sources: Dict[str, Literal["db", "config"]] = {}
+        """
+        Guardrail id to provenance marker. "db" entries are reconciled against
+        the DB on each polling tick; "config" entries are owned by proxy_config.yaml
+        and never deleted by reconciliation.
+        """
+
     def initialize_guardrail(
         self,
         guardrail: Guardrail,
         config_file_path: Optional[str] = None,
+        llm_router: Optional["Router"] = None,
+        source: Literal["db", "config"] = "config",
     ) -> Optional[Guardrail]:
         """
         Initialize a guardrail from a dictionary and add it to the litellm callback manager
@@ -400,6 +428,10 @@ class InMemoryGuardrailHandler:
             verbose_proxy_logger.debug(
                 "guardrail_id already exists in IN_MEMORY_GUARDRAILS"
             )
+            # Honor the caller's source even on the early-return path so a
+            # racing polling tick or a hot-reload of config can correct an
+            # entry's provenance.
+            self._sources[guardrail_id] = source
             return self.IN_MEMORY_GUARDRAILS[guardrail_id]
 
         custom_guardrail_callback: Optional[CustomGuardrail] = None
@@ -436,7 +468,16 @@ class InMemoryGuardrailHandler:
         initializer = guardrail_initializer_registry.get(guardrail_type)
 
         if initializer:
-            custom_guardrail_callback = initializer(litellm_params, guardrail)
+            # Try to call with llm_router first, fall back to without if it fails
+            import inspect
+
+            sig = inspect.signature(initializer)
+            if "llm_router" in sig.parameters:
+                custom_guardrail_callback = initializer(
+                    litellm_params, guardrail, llm_router  # type: ignore
+                )
+            else:
+                custom_guardrail_callback = initializer(litellm_params, guardrail)
         elif isinstance(guardrail_type, str) and "." in guardrail_type:
             custom_guardrail_callback = self.initialize_custom_guardrail(
                 guardrail=cast(dict, guardrail),
@@ -447,6 +488,18 @@ class InMemoryGuardrailHandler:
         else:
             raise ValueError(f"Unsupported guardrail: {guardrail_type}")
 
+        if custom_guardrail_callback is not None:
+            setattr(
+                custom_guardrail_callback,
+                "skip_system_message_in_guardrail",
+                getattr(litellm_params, "skip_system_message_in_guardrail", None),
+            )
+            setattr(
+                custom_guardrail_callback,
+                "skip_tool_message_in_guardrail",
+                getattr(litellm_params, "skip_tool_message_in_guardrail", None),
+            )
+
         parsed_guardrail = Guardrail(
             guardrail_id=guardrail.get("guardrail_id"),
             guardrail_name=guardrail["guardrail_name"],
@@ -456,6 +509,7 @@ class InMemoryGuardrailHandler:
         # store references to the guardrail in memory
         self.IN_MEMORY_GUARDRAILS[guardrail_id] = parsed_guardrail
         self.guardrail_id_to_custom_guardrail[guardrail_id] = custom_guardrail_callback
+        self._sources[guardrail_id] = source
 
         return parsed_guardrail
 
@@ -467,7 +521,7 @@ class InMemoryGuardrailHandler:
         config_file_path: Optional[str] = None,
     ) -> Optional[CustomGuardrail]:
         """
-        Initialize a Custom Guardrail from a python file
+        Initialize a Custom Guardrail from a python file or module path
 
         This initializes it by adding it to the litellm callback manager
         """
@@ -476,26 +530,14 @@ class InMemoryGuardrailHandler:
                 "GuardrailsAIException - Please pass the config_file_path to initialize_guardrails_v2"
             )
 
-        _file_name, _class_name = guardrail_type.split(".")
         verbose_proxy_logger.debug(
-            "Initializing custom guardrail: %s, file_name: %s, class_name: %s",
+            "Initializing custom guardrail: %s",
             guardrail_type,
-            _file_name,
-            _class_name,
         )
 
-        directory = os.path.dirname(config_file_path)
-        module_file_path = os.path.join(directory, _file_name) + ".py"
-
-        spec = importlib.util.spec_from_file_location(_class_name, module_file_path)  # type: ignore
-        if not spec:
-            raise ImportError(
-                f"Could not find a module specification for {module_file_path}"
-            )
-
-        module = importlib.util.module_from_spec(spec)  # type: ignore
-        spec.loader.exec_module(module)  # type: ignore
-        _guardrail_class = getattr(module, _class_name)
+        _guardrail_class = get_instance_fn(
+            guardrail_type, config_file_path=config_file_path
+        )
 
         mode = litellm_params.mode
         if mode is None:
@@ -504,17 +546,34 @@ class InMemoryGuardrailHandler:
             )
 
         default_on = litellm_params.default_on
+
+        # Extract additional params from litellm_params to pass to custom guardrail
+        # This matches the behavior of other guardrail initializers (e.g., initialize_lakera)
+        # and aligns with the documented behavior for custom guardrails
+        if hasattr(litellm_params, "model_dump"):
+            extra_params = litellm_params.model_dump(exclude_none=True)
+        else:
+            extra_params = dict(litellm_params) if litellm_params else {}
+
+        # Remove params that are handled explicitly or are internal
+        for key in ["guardrail", "mode", "default_on"]:
+            extra_params.pop(key, None)
+
         _guardrail_callback = _guardrail_class(
             guardrail_name=guardrail["guardrail_name"],
             event_hook=mode,
             default_on=default_on,
+            **extra_params,
         )
         litellm.logging_callback_manager.add_litellm_callback(_guardrail_callback)  # type: ignore
 
         return _guardrail_callback
 
     def update_in_memory_guardrail(
-        self, guardrail_id: str, guardrail: Guardrail
+        self,
+        guardrail_id: str,
+        guardrail: Guardrail,
+        source: Literal["db", "config"] = "db",
     ) -> None:
         """
         Update a guardrail in memory
@@ -523,6 +582,7 @@ class InMemoryGuardrailHandler:
         - updates the guardrail params in litellm.callback_manager
         """
         self.IN_MEMORY_GUARDRAILS[guardrail_id] = guardrail
+        self._sources[guardrail_id] = source
 
         custom_guardrail_callback = self.guardrail_id_to_custom_guardrail.get(
             guardrail_id
@@ -541,14 +601,17 @@ class InMemoryGuardrailHandler:
         """
         # Remove from in-memory storage
         self.IN_MEMORY_GUARDRAILS.pop(guardrail_id, None)
-        
+        self._sources.pop(guardrail_id, None)
+
         # Remove the callback from litellm.callbacks
-        custom_guardrail_callback = self.guardrail_id_to_custom_guardrail.pop(guardrail_id, None)
+        custom_guardrail_callback = self.guardrail_id_to_custom_guardrail.pop(
+            guardrail_id, None
+        )
         if custom_guardrail_callback:
             litellm.logging_callback_manager.remove_callback_from_list_by_object(
                 callback_list=litellm.callbacks,
                 obj=custom_guardrail_callback,
-                require_self=False
+                require_self=False,
             )
 
     def list_in_memory_guardrails(self) -> List[Guardrail]:
@@ -563,6 +626,34 @@ class InMemoryGuardrailHandler:
         """
         return self.IN_MEMORY_GUARDRAILS.get(guardrail_id)
 
+    def get_source(self, guardrail_id: str) -> Optional[Literal["db", "config"]]:
+        """
+        Return the provenance of an in-memory guardrail.
+        """
+        return self._sources.get(guardrail_id)
+
+    def reconcile_db_guardrails(self, db_guardrail_ids: Set[str]) -> List[str]:
+        """
+        Drop in-memory entries that originated from the DB but are no longer
+        present in db_guardrail_ids. Config-loaded guardrails are never touched.
+
+        Called by the periodic DB polling tick so that a guardrail deleted
+        on another pod is eventually purged from this pod's memory + callbacks.
+        """
+        stale_ids = [
+            guardrail_id
+            for guardrail_id, source in self._sources.items()
+            if source == "db" and guardrail_id not in db_guardrail_ids
+        ]
+        for guardrail_id in stale_ids:
+            verbose_proxy_logger.info(
+                "Reconcile: removing stale DB-backed guardrail '%s' from memory "
+                "(deleted in DB by another pod)",
+                guardrail_id,
+            )
+            self.delete_in_memory_guardrail(guardrail_id)
+        return stale_ids
+
     def _has_guardrail_params_changed(
         self, guardrail_id: str, new_guardrail: Guardrail
     ) -> bool:
@@ -573,27 +664,27 @@ class InMemoryGuardrailHandler:
         existing = self.IN_MEMORY_GUARDRAILS.get(guardrail_id)
         if existing is None:
             return True
-        
+
         # Compare guardrail_name
         if existing.get("guardrail_name") != new_guardrail.get("guardrail_name"):
             return True
-        
+
         # Compare litellm_params
         existing_params = existing.get("litellm_params")
         new_params = new_guardrail.get("litellm_params")
-        
+
         # Convert to dicts for comparison
         existing_dict = (
-            existing_params.model_dump() 
-            if isinstance(existing_params, LitellmParams) 
+            existing_params.model_dump()
+            if isinstance(existing_params, LitellmParams)
             else existing_params
         )
         new_dict = (
-            new_params.model_dump() 
-            if isinstance(new_params, LitellmParams) 
+            new_params.model_dump()
+            if isinstance(new_params, LitellmParams)
             else new_params
         )
-        
+
         # Compare and identify specific differences
         changed_fields = {}
         if existing_dict is not None and new_dict is not None:
@@ -605,18 +696,21 @@ class InMemoryGuardrailHandler:
                     changed_fields[key] = {"old": old_val, "new": new_val}
         elif existing_dict != new_dict:
             changed_fields = {"litellm_params": {"old": existing_dict, "new": new_dict}}
-        
+
         # Log differences if any found
         if changed_fields:
             verbose_proxy_logger.debug(
                 f"Guardrail params changed. Differences: {changed_fields}"
             )
-        
+
         # Return True if any fields changed
         return len(changed_fields) > 0
 
     def reinitialize_guardrail(
-        self, guardrail: Guardrail, config_file_path: Optional[str] = None
+        self,
+        guardrail: Guardrail,
+        config_file_path: Optional[str] = None,
+        source: Literal["db", "config"] = "config",
     ) -> Optional[Guardrail]:
         """
         Force re-initialization of a guardrail even if it exists in memory.
@@ -624,16 +718,18 @@ class InMemoryGuardrailHandler:
         """
         guardrail_id = guardrail.get("guardrail_id")
         if not guardrail_id:
-            verbose_proxy_logger.error("Cannot reinitialize guardrail without guardrail_id")
+            verbose_proxy_logger.error(
+                "Cannot reinitialize guardrail without guardrail_id"
+            )
             return None
-        
+
         # Remove from memory if exists (also removes from callbacks)
         if guardrail_id in self.IN_MEMORY_GUARDRAILS:
             self.delete_in_memory_guardrail(guardrail_id)
-        
+
         # Initialize fresh (will add new callback to litellm.callbacks)
         return self.initialize_guardrail(
-            guardrail=guardrail, config_file_path=config_file_path
+            guardrail=guardrail, config_file_path=config_file_path, source=source
         )
 
     def sync_guardrail_from_db(
@@ -647,16 +743,22 @@ class InMemoryGuardrailHandler:
         if not guardrail_id:
             verbose_proxy_logger.error("Cannot sync guardrail without guardrail_id")
             return None
-        
+
         if self._has_guardrail_params_changed(guardrail_id, guardrail):
             guardrail_name = guardrail.get("guardrail_name", "Unknown")
             verbose_proxy_logger.info(
                 f"Guardrail '{guardrail_name}' (ID: {guardrail_id}) params changed, re-initializing..."
             )
             return self.reinitialize_guardrail(
-                guardrail=guardrail, config_file_path=config_file_path
+                guardrail=guardrail,
+                config_file_path=config_file_path,
+                source="db",
             )
-        
+
+        # Params unchanged but the entry is still DB-backed; make sure the
+        # source marker reflects that even if it was previously set differently
+        # (e.g. a config entry whose UUID later collided with a DB row).
+        self._sources[guardrail_id] = "db"
         return self.IN_MEMORY_GUARDRAILS.get(guardrail_id)
 
 

@@ -9,12 +9,25 @@
 
 ## LiteLLM versions of the OpenAI Exception Types
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 import openai
 
 from litellm.types.utils import LiteLLMCommonStrings
+
+_MINIMAL_ERROR_RESPONSE: Optional[httpx.Response] = None
+
+
+def _get_minimal_error_response() -> httpx.Response:
+    """Get a cached minimal httpx.Response object for error cases."""
+    global _MINIMAL_ERROR_RESPONSE
+    if _MINIMAL_ERROR_RESPONSE is None:
+        _MINIMAL_ERROR_RESPONSE = httpx.Response(
+            status_code=400,
+            request=httpx.Request(method="GET", url="https://litellm.ai"),
+        )
+    return _MINIMAL_ERROR_RESPONSE
 
 
 class AuthenticationError(openai.AuthenticationError):  # type: ignore
@@ -125,16 +138,21 @@ class BadRequestError(openai.BadRequestError):  # type: ignore
         self.model = model
         self.llm_provider = llm_provider
         self.litellm_debug_info = litellm_debug_info
-        response = httpx.Response(
-            status_code=self.status_code,
-            request=httpx.Request(
-                method="GET", url="https://litellm.ai"
-            ),  # mock request object
-        )
         self.max_retries = max_retries
         self.num_retries = num_retries
+        # Use response if it's a valid httpx.Response with a request, otherwise use minimal error response
+        # Note: We check _request (not .request property) to avoid RuntimeError when _request is None
+        if (
+            response is not None
+            and isinstance(response, httpx.Response)
+            and hasattr(response, "_request")
+            and getattr(response, "_request", None) is not None
+        ):
+            self.response = response
+        else:
+            self.response = _get_minimal_error_response()
         super().__init__(
-            self.message, response=response, body=body
+            self.message, response=self.response, body=body
         )  # Call the base class constructor with the parameters it needs
 
     def __str__(self):
@@ -263,7 +281,7 @@ class Timeout(openai.APITimeoutError):  # type: ignore
         return _message
 
 
-class PermissionDeniedError(openai.PermissionDeniedError):  # type:ignore
+class PermissionDeniedError(openai.PermissionDeniedError):  # type: ignore
     def __init__(
         self,
         message,
@@ -368,13 +386,11 @@ class ContextWindowExceededError(BadRequestError):  # type: ignore
         self.model = model
         self.llm_provider = llm_provider
         self.litellm_debug_info = litellm_debug_info
-        request = httpx.Request(method="POST", url="https://api.openai.com/v1")
-        self.response = httpx.Response(status_code=400, request=request)
         super().__init__(
             message=message,
             model=self.model,  # type: ignore
             llm_provider=self.llm_provider,  # type: ignore
-            response=self.response,
+            response=response,
             litellm_debug_info=self.litellm_debug_info,
         )  # Call the base class constructor with the parameters it needs
 
@@ -451,24 +467,22 @@ class ContentPolicyViolationError(BadRequestError):  # type: ignore
         response: Optional[httpx.Response] = None,
         litellm_debug_info: Optional[str] = None,
         provider_specific_fields: Optional[dict] = None,
+        body: Optional[dict] = None,
     ):
         self.status_code = 400
         self.message = "litellm.ContentPolicyViolationError: {}".format(message)
         self.model = model
         self.llm_provider = llm_provider
         self.litellm_debug_info = litellm_debug_info
-        request = httpx.Request(method="POST", url="https://api.openai.com/v1")
-        self.response = httpx.Response(status_code=400, request=request)
         self.provider_specific_fields = provider_specific_fields
-        
         super().__init__(
             message=self.message,
             model=self.model,  # type: ignore
             llm_provider=self.llm_provider,  # type: ignore
-            response=self.response,
+            response=response,
             litellm_debug_info=self.litellm_debug_info,
+            body=body,
         )  # Call the base class constructor with the parameters it needs
-    
 
     def __str__(self):
         return self._transform_error_to_string()
@@ -833,6 +847,7 @@ class BudgetExceededError(Exception):
     ):
         self.current_cost = current_cost
         self.max_budget = max_budget
+        self.status_code = 429
         message = (
             message
             or f"Budget has been exceeded! Current cost: {current_cost}, Max budget: {max_budget}"
@@ -898,9 +913,17 @@ class LiteLLMUnknownProvider(BadRequestError):
 
 
 class GuardrailRaisedException(Exception):
-    def __init__(self, guardrail_name: Optional[str] = None, message: str = ""):
+    def __init__(
+        self,
+        guardrail_name: Optional[str] = None,
+        message: str = "",
+        should_wrap_with_default_message: bool = True,
+        status_code: int = 400,
+    ):
+        default_message = f"Guardrail raised an exception, Guardrail: {guardrail_name}, Message: {message}"
         self.guardrail_name = guardrail_name
-        self.message = f"Guardrail raised an exception, Guardrail: {guardrail_name}, Message: {message}"
+        self.status_code = status_code
+        self.message = default_message if should_wrap_with_default_message else message
         super().__init__(self.message)
 
 
@@ -909,12 +932,14 @@ class BlockedPiiEntityError(Exception):
         self,
         entity_type: str,
         guardrail_name: Optional[str] = None,
+        status_code: int = 400,
     ):
         """
         Raised when a blocked entity is detected by a guardrail.
         """
         self.entity_type = entity_type
         self.guardrail_name = guardrail_name
+        self.status_code = status_code
         self.message = f"Blocked entity detected: {entity_type} by Guardrail: {guardrail_name}. This entity is not allowed to be used in this request."
         super().__init__(self.message)
 
@@ -933,7 +958,8 @@ class MidStreamFallbackError(ServiceUnavailableError):  # type: ignore
         generated_content: str = "",
         is_pre_first_chunk: bool = False,
     ):
-        self.status_code = 503  # Service Unavailable
+        original_status = getattr(original_exception, "status_code", None)
+        self.status_code = int(original_status) if original_status is not None else 503
         self.message = f"litellm.MidStreamFallbackError: {message}"
         self.model = model
         self.llm_provider = llm_provider
@@ -956,7 +982,14 @@ class MidStreamFallbackError(ServiceUnavailableError):  # type: ignore
         else:
             self.response = response
 
-        # Call the parent constructor
+        # Save the original attributes before they are overridden by ServiceUnavailableError
+        _saved_response = self.response
+        _saved_request = getattr(self.response, "request", None) or httpx.Request(
+            method="POST", url=f"https://{llm_provider}.com/v1/"
+        )
+        _saved_message = self.message
+
+        # Call the parent constructor (which hardcodes status_code=503 and modifies the response object)
         super().__init__(
             message=self.message,
             llm_provider=llm_provider,
@@ -966,6 +999,13 @@ class MidStreamFallbackError(ServiceUnavailableError):  # type: ignore
             max_retries=self.max_retries,
             num_retries=self.num_retries,
         )
+
+        # Restore the propagated status and original response/request objects
+        self.status_code = int(original_status) if original_status is not None else 503
+        self.response = _saved_response
+        self.request = _saved_request
+        self.message = _saved_message
+        self.args = (_saved_message,)
 
     def __str__(self):
         _message = self.message
@@ -979,6 +1019,35 @@ class MidStreamFallbackError(ServiceUnavailableError):  # type: ignore
 
     def __repr__(self):
         return self.__str__()
+
+
+class ModifyResponseException(Exception):
+    """
+    Exception raised when a guardrail wants to modify the response.
+
+    This exception carries the synthetic response that should be returned
+    to the user instead of calling the LLM or instead of the LLM's response.
+    It should be caught by the proxy and returned with a 200 status code.
+
+    This is a base exception that all guardrails can use to replace responses,
+    allowing violation messages to be returned as successful responses
+    rather than errors.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        model: str,
+        request_data: Dict[str, Any],
+        guardrail_name: Optional[str] = None,
+        detection_info: Optional[Dict[str, Any]] = None,
+    ):
+        self.message = message
+        self.model = model
+        self.request_data = request_data
+        self.guardrail_name = guardrail_name
+        self.detection_info = detection_info or {}
+        super().__init__(message)
 
 
 class GuardrailInterventionNormalStringError(

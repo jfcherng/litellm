@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 """
 Common utilities used across bedrock chat/embedding/image generation
 """
 
+import functools
 import json
 import os
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 if TYPE_CHECKING:
     from litellm.types.llms.bedrock import BedrockCreateBatchRequest
@@ -12,10 +15,11 @@ if TYPE_CHECKING:
 import httpx
 
 import litellm
+from litellm import verbose_logger
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
 )
-from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
+from litellm.llms.base_llm.base_utils import BaseLLMModelInfo, BaseTokenCounter
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.secret_managers.main import get_secret
 
@@ -25,6 +29,211 @@ if TYPE_CHECKING:
 
 class BedrockError(BaseLLMException):
     pass
+
+
+# Lazy import cache to avoid circular imports and performance impact
+_get_model_info = None
+
+BedrockOutputConfigEffort = Literal["low", "medium", "high", "max", "xhigh"]
+_BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER: Dict[BedrockOutputConfigEffort, int] = {
+    "low": 0,
+    "medium": 1,
+    "high": 2,
+    "max": 3,
+    "xhigh": 4,
+}
+
+
+def get_cached_model_info():
+    """
+    Lazy import and cache get_model_info to avoid circular imports.
+
+    This function is used by bedrock transformation classes that need get_model_info
+    but cannot import it at module level due to circular import issues.
+    The function is cached after first use to avoid performance impact.
+    """
+    global _get_model_info
+    if _get_model_info is None:
+        from litellm import get_model_info
+
+        _get_model_info = get_model_info
+    return _get_model_info
+
+
+@functools.lru_cache(maxsize=1)
+def _get_local_model_cost_map() -> Dict:
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+
+    return GetModelCostMap.load_local_model_cost_map()
+
+
+def pop_bedrock_invoke_output_config_format(request_body: Dict) -> Optional[Dict]:
+    """
+    Remove and return Anthropic's nested ``output_config.format`` field.
+
+    Bedrock Invoke paths convert the schema to inline message text. Any remaining
+    ``output_config`` keys, such as ``effort``, are left in place.
+    """
+    output_config = request_body.get("output_config")
+    if not isinstance(output_config, dict):
+        return None
+
+    output_format = output_config.pop("format", None)
+    if not output_config:
+        request_body.pop("output_config", None)
+
+    if isinstance(output_format, dict):
+        return output_format
+    return None
+
+
+def convert_bedrock_invoke_output_format_to_inline_schema(
+    output_format: Dict,
+    request_body: Dict,
+) -> None:
+    """
+    Embed an Anthropic structured-output schema into the last user message.
+
+    Bedrock Invoke does not support ``output_format`` directly, so the schema is
+    appended to the final user message for prompt-engineered structured output.
+    The caller's ``messages`` list, message dict, and content list are not
+    mutated; a fresh ``messages`` list with a copied final user message is
+    written back to ``request_body``.
+    """
+    schema = output_format.get("schema")
+    if not schema:
+        return
+
+    messages = request_body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return
+
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx is None:
+        return
+
+    original = messages[last_user_idx]
+    content = original.get("content", [])
+    schema_block = {"type": "text", "text": json.dumps(schema)}
+    if isinstance(content, str):
+        new_content = [{"type": "text", "text": content}, schema_block]
+    elif isinstance(content, list):
+        new_content = [*content, schema_block]
+    else:
+        return
+
+    new_messages = list(messages)
+    new_messages[last_user_idx] = {**original, "content": new_content}
+    request_body["messages"] = new_messages
+
+
+def remove_custom_field_from_tools(request_body: dict) -> None:
+    """
+    Remove ``custom`` field from each tool in the request body.
+
+    Claude Code (v2.1.69+) sends ``custom: {defer_loading: true}`` on tool
+    definitions, which Anthropic's API accepts but Bedrock rejects with
+    ``"Extra inputs are not permitted"``.
+
+    Args:
+        request_body: The request dictionary to modify in-place.
+
+    Ref: https://github.com/BerriAI/litellm/issues/22847
+    """
+    tools = request_body.get("tools")
+    if not tools or not isinstance(tools, list):
+        return
+    for tool in tools:
+        if isinstance(tool, dict):
+            tool.pop("custom", None)
+
+
+def normalize_json_schema_custom_types_to_object(schema: dict) -> None:
+    """
+    In-place: replace JSON Schema ``type: \"custom\"`` with ``\"object\"`` (iterative walk).
+
+    Anthropic / Claude Code use ``custom`` for tool schemas; Bedrock Invoke and
+    Bedrock Converse only accept standard JSON Schema type strings.
+
+    Uses an explicit stack (not recursion) to satisfy recursive-function guards in CI.
+    """
+    stack: List[Any] = [schema]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        if node.get("type") == "custom":
+            node["type"] = "object"
+        items = node.get("items")
+        if isinstance(items, dict):
+            stack.append(items)
+        addl = node.get("additionalProperties")
+        if isinstance(addl, dict):
+            stack.append(addl)
+        props = node.get("properties")
+        if isinstance(props, dict):
+            for sub in props.values():
+                if isinstance(sub, dict):
+                    stack.append(sub)
+        for combiner in ("allOf", "anyOf", "oneOf"):
+            arr = node.get(combiner)
+            if isinstance(arr, list):
+                for sub in arr:
+                    if isinstance(sub, dict):
+                        stack.append(sub)
+
+
+def normalize_tool_input_schema_types_for_bedrock_invoke(request_body: dict) -> None:
+    """
+    Bedrock Invoke (Anthropic Messages) validates ``input_schema`` as JSON Schema.
+    Anthropic's API allows ``type: \"custom\"`` for Claude Code custom tools; Bedrock
+    rejects it with: ``tools.0.custom.input_schema.type: Input should be 'object'``.
+
+    Normalizes ``type: \"custom\"`` to ``\"object\"`` throughout each tool's
+    ``input_schema`` (recursive for nested properties, items, combinators).
+
+    Args:
+        request_body: Request dictionary to modify in-place.
+    """
+    tools = request_body.get("tools")
+    if not tools or not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        input_schema = tool.get("input_schema")
+        if isinstance(input_schema, dict):
+            normalize_json_schema_custom_types_to_object(input_schema)
+
+
+def ensure_bedrock_anthropic_messages_tool_names(request_body: dict) -> None:
+    """
+    Bedrock Invoke (Anthropic Messages) requires each tool to include ``name``.
+    Some clients send only ``input_schema``; Bedrock then errors with
+    ``tools.0.custom.name: Field required``.
+
+    In-place: set ``name`` to ``litellm_unnamed_tool_{index}`` when missing or blank.
+    """
+    tools = request_body.get("tools")
+    if not tools or not isinstance(tools, list):
+        return
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if name is None or (isinstance(name, str) and not name.strip()):
+            tool["name"] = f"litellm_unnamed_tool_{i}"
 
 
 class AmazonBedrockGlobalConfig:
@@ -113,6 +322,20 @@ def add_custom_header(headers):
     return callback
 
 
+def _get_bedrock_client_ssl_verify() -> Union[bool, str]:
+    """
+    Get SSL verification setting for Bedrock client.
+
+    Returns the SSL verification setting which can be:
+    - True: Use default SSL verification
+    - False: Disable SSL verification
+    - str: Path to a custom CA bundle file
+    """
+    from litellm.llms.custom_httpx.http_handler import get_ssl_verify
+
+    return get_ssl_verify()
+
+
 def init_bedrock_client(
     region_name=None,
     aws_access_key_id: Optional[str] = None,
@@ -158,8 +381,7 @@ def init_bedrock_client(
         aws_web_identity_token,
     ) = params_to_check
 
-    # SSL certificates (a.k.a CA bundle) used to verify the identity of requested hosts.
-    ssl_verify = os.getenv("SSL_VERIFY", litellm.ssl_verify)
+    ssl_verify = _get_bedrock_client_ssl_verify()
 
     ### SET REGION NAME
     if region_name:
@@ -210,7 +432,7 @@ def init_bedrock_client(
                 status_code=401,
             )
 
-        sts_client = boto3.client("sts")
+        sts_client = boto3.client("sts", verify=ssl_verify)
 
         # https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sts/client/assume_role_with_web_identity.html
@@ -237,7 +459,7 @@ def init_bedrock_client(
             "sts",
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
-            verify=ssl_verify
+            verify=ssl_verify,
         )
 
         sts_response = sts_client.assume_role(
@@ -340,6 +562,189 @@ def get_bedrock_tool_name(response_tool_name: str) -> str:
     return response_tool_name
 
 
+# Cache the global regions list at module level
+_BEDROCK_GLOBAL_REGIONS: Optional[List[str]] = None
+
+
+def _get_all_bedrock_regions() -> List[str]:
+    """Get all Bedrock regions, cached at module level."""
+    global _BEDROCK_GLOBAL_REGIONS
+    if _BEDROCK_GLOBAL_REGIONS is None:
+        _BEDROCK_GLOBAL_REGIONS = AmazonBedrockGlobalConfig().get_all_regions()
+    return _BEDROCK_GLOBAL_REGIONS
+
+
+def get_bedrock_cross_region_inference_regions() -> List[str]:
+    """Abbreviations of regions AWS Bedrock supports for cross region inference."""
+    return ["global", "us", "eu", "apac", "jp", "au", "us-gov"]
+
+
+def extract_model_name_from_bedrock_arn(model: str) -> str:
+    """
+    Extract the model name from an AWS Bedrock ARN.
+    Returns the string after the last '/' if 'arn' is in the input string.
+    """
+    if "arn" in model.lower():
+        return model.split("/")[-1]
+    return model
+
+
+def strip_bedrock_routing_prefix(model: str) -> str:
+    """Strip LiteLLM routing prefixes from model name."""
+    for prefix in ["bedrock/", "converse/", "invoke/", "openai/", "nova-2/", "nova/"]:
+        if model.startswith(prefix):
+            model = model.split("/", 1)[1]
+    return model
+
+
+def strip_bedrock_throughput_suffix(model: str) -> str:
+    """Strip throughput tier suffixes and context window suffixes from Bedrock model names."""
+    import re
+
+    # Pattern matches model:version:throughput where throughput is like 51k, 18k, etc.
+    # Keep the model:version part, strip the :throughput suffix
+    model = re.sub(r"(:\d+):\d+k$", r"\1", model)
+    # Strip context window suffixes like [1m], [200k], etc.
+    # e.g. "us.anthropic.claude-opus-4-6-v1[1m]" -> "us.anthropic.claude-opus-4-6-v1"
+    model = re.sub(r"\[\w+\]$", "", model)
+    return model
+
+
+def get_bedrock_base_model(model: str) -> str:
+    """
+    Get the base model from the given model name.
+
+    Handle model names like:
+    - "us.meta.llama3-2-11b-instruct-v1:0" -> "meta.llama3-2-11b-instruct-v1"
+    - "bedrock/converse/model" -> "model"
+    - "anthropic.claude-3-5-sonnet-20241022-v2:0:51k" -> "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    - "bedrock/nova-2/arn:aws:..." -> "amazon.nova-2-custom"
+    - "bedrock/nova/arn:aws:..." -> "amazon.nova-custom"
+    """
+    # Detect nova spec prefixes before stripping them
+    stripped = model
+    for rp in ["bedrock/converse/", "bedrock/", "converse/"]:
+        if stripped.startswith(rp):
+            stripped = stripped[len(rp) :]
+            break
+    if stripped.startswith("nova-2/"):
+        return "amazon.nova-2-custom"
+    elif stripped.startswith("nova/"):
+        return "amazon.nova-custom"
+
+    model = strip_bedrock_routing_prefix(model)
+    model = extract_model_name_from_bedrock_arn(model)
+    model = strip_bedrock_throughput_suffix(model)
+
+    potential_region = model.split(".", 1)[0]
+    alt_potential_region = model.split("/", 1)[0]
+
+    if potential_region in get_bedrock_cross_region_inference_regions():
+        return model.split(".", 1)[1]
+    elif (
+        alt_potential_region in _get_all_bedrock_regions()
+        and len(model.split("/", 1)) > 1
+    ):
+        return model.split("/", 1)[1]
+
+    return model
+
+
+def is_claude_4_5_on_bedrock(model: str) -> bool:
+    """
+    Check if the model is a Claude 4.5 model on Bedrock.
+    Claude 4.5 models support prompt caching with '5m' and '1h' TTL on Bedrock.
+    """
+    model_lower = model.lower()
+    claude_4_5_patterns = [
+        "sonnet-4.5",
+        "sonnet_4.5",
+        "sonnet-4-5",
+        "sonnet_4_5",
+        "haiku-4.5",
+        "haiku_4.5",
+        "haiku-4-5",
+        "haiku_4_5",
+        "opus-4.5",
+        "opus_4.5",
+        "opus-4-5",
+        "opus_4_5",
+        "sonnet-4.6",
+        "sonnet_4.6",
+        "sonnet-4-6",
+        "sonnet_4_6",
+        "opus-4.6",
+        "opus_4.6",
+        "opus-4-6",
+        "opus_4_6",
+        "opus-4.7",
+        "opus_4.7",
+        "opus-4-7",
+        "opus_4_7",
+    ]
+    return any(pattern in model_lower for pattern in claude_4_5_patterns)
+
+
+def normalize_bedrock_opus_output_config_effort(model: str, output_config: Any) -> None:
+    """
+    Normalize Anthropic ``output_config.effort`` values for Bedrock Opus ids.
+
+    Bedrock's Claude Opus request validator can accept a narrower effort
+    vocabulary than Anthropic's compatibility surface. The Bedrock ceiling is
+    read from ``model_prices_and_context_window.json`` via
+    ``bedrock_output_config_effort_ceiling``.
+
+    Mutates ``output_config`` in place so callers can accept Claude Code's
+    ``xhigh`` input without forwarding a provider-invalid value.
+    """
+    if not isinstance(output_config, dict):
+        return
+
+    effort = output_config.get("effort")
+    if effort not in _BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER:
+        return
+
+    ceiling = _get_bedrock_output_config_effort_ceiling(model)
+    if ceiling is None:
+        return
+
+    if (
+        _BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER[effort]
+        > _BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER[ceiling]
+    ):
+        output_config["effort"] = ceiling
+
+
+def _get_bedrock_output_config_effort_ceiling(
+    model: str,
+) -> Optional[BedrockOutputConfigEffort]:
+    try:
+        model_info = get_cached_model_info()(
+            model=model,
+            custom_llm_provider="bedrock",
+        )
+    except Exception:
+        return None
+
+    ceiling = model_info.get("bedrock_output_config_effort_ceiling")
+    if isinstance(ceiling, str) and ceiling in _BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER:
+        return ceiling  # type: ignore[return-value]
+
+    model_cost_key = model_info.get("key")
+    if not isinstance(model_cost_key, str):
+        return None
+
+    local_model_info = _get_local_model_cost_map().get(model_cost_key, {})
+    ceiling = local_model_info.get("bedrock_output_config_effort_ceiling")
+    if isinstance(ceiling, str) and ceiling in _BEDROCK_OUTPUT_CONFIG_EFFORT_ORDER:
+        return ceiling  # type: ignore[return-value]
+    return None
+
+
+# Import after standalone functions to avoid circular imports
+from litellm.llms.bedrock.count_tokens.bedrock_token_counter import BedrockTokenCounter
+
+
 class BedrockModelInfo(BaseLLMModelInfo):
     global_config = AmazonBedrockGlobalConfig()
     all_global_regions = global_config.get_all_regions()
@@ -375,96 +780,104 @@ class BedrockModelInfo(BaseLLMModelInfo):
     ) -> List[str]:
         return []
 
-    @staticmethod
-    def extract_model_name_from_arn(model: str) -> str:
-        """
-        Extract the model name from an AWS Bedrock ARN.
-        Returns the string after the last '/' if 'arn' is in the input string.
+    # def get_provider_info(self, model: str) -> Optional[ProviderSpecificModelInfo]:
+    #     """
+    #     Handles Bedrock throughput suffixes like ":28k", ":51k".
+    #     """
+    #     import re
 
-        Args:
-            arn (str): The ARN string to parse
+    #     overrides: ProviderSpecificModelInfo = {}
+
+    #     # Parse context window suffix (e.g., :28k, :51k)
+    #     match = re.search(r":(\d+)k$", model)
+    #     if match:
+    #         throughput_value = int(match.group(1)) * 1000
+    #         overrides["max_input_tokens"] = throughput_value
+
+    #     return overrides if overrides else None
+
+    def get_token_counter(self) -> Optional[BaseTokenCounter]:
+        """
+        Factory method to create a Bedrock token counter.
 
         Returns:
-            str: The extracted model name if 'arn' is in the string,
-                otherwise returns the original string
+            BedrockTokenCounter instance for this provider.
         """
-        if "arn" in model.lower():
-            return model.split("/")[-1]
-        return model
+        return BedrockTokenCounter()
+
+    @staticmethod
+    def extract_model_name_from_arn(model: str) -> str:
+        """Wrapper for standalone function. See extract_model_name_from_bedrock_arn()."""
+        return extract_model_name_from_bedrock_arn(model)
 
     @staticmethod
     def get_non_litellm_routing_model_name(model: str) -> str:
-        if model.startswith("bedrock/"):
-            model = model.split("/", 1)[1]
-
-        if model.startswith("converse/"):
-            model = model.split("/", 1)[1]
-
-        if model.startswith("invoke/"):
-            model = model.split("/", 1)[1]
-
-        return model
+        """Wrapper for standalone function. See strip_bedrock_routing_prefix()."""
+        return strip_bedrock_routing_prefix(model)
 
     @staticmethod
     def get_base_model(model: str) -> str:
-        """
-        Get the base model from the given model name.
-
-        Handle model names like - "us.meta.llama3-2-11b-instruct-v1:0" -> "meta.llama3-2-11b-instruct-v1"
-        AND "meta.llama3-2-11b-instruct-v1:0" -> "meta.llama3-2-11b-instruct-v1"
-        """
-
-        model = BedrockModelInfo.get_non_litellm_routing_model_name(model=model)
-        model = BedrockModelInfo.extract_model_name_from_arn(model)
-
-        potential_region = model.split(".", 1)[0]
-
-        alt_potential_region = model.split("/", 1)[
-            0
-        ]  # in model cost map we store regional information like `/us-west-2/bedrock-model`
-
-        if (
-            potential_region
-            in BedrockModelInfo._supported_cross_region_inference_region()
-        ):
-            return model.split(".", 1)[1]
-        elif (
-            alt_potential_region in BedrockModelInfo.all_global_regions
-            and len(model.split("/", 1)) > 1
-        ):
-            return model.split("/", 1)[1]
-
-        return model
+        """Wrapper for standalone function. See get_bedrock_base_model()."""
+        return get_bedrock_base_model(model)
 
     @staticmethod
     def _supported_cross_region_inference_region() -> List[str]:
-        """
-        Abbreviations of regions AWS Bedrock supports for cross region inference
-        """
-        return ["global", "us", "eu", "apac", "jp", "au", "us-gov"]
+        """Wrapper for standalone function. See get_bedrock_cross_region_inference_regions()."""
+        return get_bedrock_cross_region_inference_regions()
 
     @staticmethod
     def get_bedrock_route(
         model: str,
-    ) -> Literal["converse", "invoke", "converse_like", "agent", "agentcore", "async_invoke"]:
+    ) -> Literal[
+        "converse",
+        "invoke",
+        "claude_platform",
+        "converse_like",
+        "agent",
+        "agentcore",
+        "async_invoke",
+        "openai",
+        "mantle",
+    ]:
         """
         Get the bedrock route for the given model.
         """
         route_mappings: Dict[
-            str, Literal["invoke", "converse_like", "converse", "agent", "agentcore", "async_invoke"]
+            str,
+            Literal[
+                "invoke",
+                "claude_platform",
+                "converse_like",
+                "converse",
+                "agent",
+                "agentcore",
+                "async_invoke",
+                "openai",
+                "mantle",
+            ],
         ] = {
             "invoke/": "invoke",
+            "claude_platform/": "claude_platform",
             "converse_like/": "converse_like",
             "converse/": "converse",
             "agent/": "agent",
             "agentcore/": "agentcore",
             "async_invoke/": "async_invoke",
+            "openai/": "openai",
+            "mantle/": "mantle",
         }
 
         # Check explicit routes first
         for prefix, route_type in route_mappings.items():
             if prefix in model:
                 return route_type
+
+        # Check for nova spec prefixes (nova/ and nova-2/)
+        _model_after_bedrock = model.replace("bedrock/", "", 1)
+        if _model_after_bedrock.startswith(
+            "nova-2/"
+        ) or _model_after_bedrock.startswith("nova/"):
+            return "converse"
 
         base_model = BedrockModelInfo.get_base_model(model)
         alt_model = BedrockModelInfo.get_non_litellm_routing_model_name(model=model)
@@ -481,6 +894,36 @@ class BedrockModelInfo(BaseLLMModelInfo):
         Check if the model is an explicit converse route.
         """
         return "converse/" in model
+
+    @staticmethod
+    def _explicit_claude_platform_route(model: str) -> bool:
+        """
+        Check if the model is an explicit Claude Platform on AWS route.
+        """
+        return "claude_platform/" in model
+
+    @staticmethod
+    def get_claude_platform_model(model: str) -> str:
+        """
+        Strip the Claude Platform route prefix from a Bedrock model name.
+        """
+        return model.replace("claude_platform/", "", 1)
+
+    @staticmethod
+    def map_claude_platform_auth_params(
+        passed_params: dict, optional_params: dict
+    ) -> dict:
+        """
+        Map Claude Platform route auth params that are not OpenAI request params.
+        """
+        for key in (
+            "workspace_id",
+            "aws_workspace_id",
+            "anthropic_workspace_id",
+        ):
+            if key in passed_params:
+                optional_params[key] = passed_params[key]
+        return optional_params
 
     @staticmethod
     def _explicit_invoke_route(model: str) -> bool:
@@ -504,6 +947,13 @@ class BedrockModelInfo(BaseLLMModelInfo):
         return "agentcore/" in model
 
     @staticmethod
+    def _explicit_mantle_route(model: str) -> bool:
+        """
+        Check if the model is an explicit mantle route (bedrock-mantle endpoint).
+        """
+        return "mantle/" in model
+
+    @staticmethod
     def _explicit_converse_like_route(model: str) -> bool:
         """
         Check if the model is an explicit converse like route.
@@ -518,6 +968,14 @@ class BedrockModelInfo(BaseLLMModelInfo):
         return "async_invoke/" in model
 
     @staticmethod
+    def _explicit_openai_route(model: str) -> bool:
+        """
+        Check if the model is an explicit openai route.
+        Used for Bedrock imported models that use OpenAI Chat Completions format.
+        """
+        return "openai/" in model
+
+    @staticmethod
     def get_bedrock_provider_config_for_messages_api(
         model: str,
     ) -> Optional[BaseAnthropicMessagesConfig]:
@@ -530,9 +988,25 @@ class BedrockModelInfo(BaseLLMModelInfo):
         """
 
         #########################################################
+        # Claude Platform route uses Anthropic Messages API via the AWS gateway.
+        #########################################################
+        if BedrockModelInfo._explicit_claude_platform_route(model):
+            return litellm.BedrockClaudePlatformMessagesConfig()
+
+        #########################################################
         # Converse routes should go through litellm.completion()
         if BedrockModelInfo._explicit_converse_route(model):
             return None
+
+        #########################################################
+        # Mantle route uses the bedrock-mantle endpoint (not bedrock-runtime)
+        #########################################################
+        if BedrockModelInfo._explicit_mantle_route(model):
+            from litellm.llms.bedrock.messages.mantle_transformation import (
+                AmazonMantleMessagesConfig,
+            )
+
+            return AmazonMantleMessagesConfig()
 
         #########################################################
         # This goes through litellm.AmazonAnthropicClaude3MessagesConfig()
@@ -550,10 +1024,10 @@ class BedrockModelInfo(BaseLLMModelInfo):
 def get_bedrock_chat_config(model: str):
     """
     Helper function to get the appropriate Bedrock chat config based on model and route.
-    
+
     Args:
         model: The model name/identifier
-        
+
     Returns:
         The appropriate Bedrock config class instance
     """
@@ -564,18 +1038,30 @@ def get_bedrock_chat_config(model: str):
     base_model = BedrockModelInfo.get_base_model(model)
 
     # Handle explicit routes first
-    if bedrock_route == "converse" or bedrock_route == "converse_like":
+    if bedrock_route == "claude_platform":
+        return litellm.BedrockClaudePlatformConfig()
+    elif bedrock_route == "converse" or bedrock_route == "converse_like":
         return litellm.AmazonConverseConfig()
+    elif bedrock_route == "openai":
+        return litellm.AmazonBedrockOpenAIConfig()
     elif bedrock_route == "agent":
         from litellm.llms.bedrock.chat.invoke_agent.transformation import (
             AmazonInvokeAgentConfig,
         )
+
         return AmazonInvokeAgentConfig()
     elif bedrock_route == "agentcore":
         from litellm.llms.bedrock.chat.agentcore.transformation import (
             AmazonAgentCoreConfig,
         )
+
         return AmazonAgentCoreConfig()
+    elif bedrock_route == "mantle":
+        from litellm.llms.bedrock.chat.mantle.transformation import (
+            AmazonMantleConfig,
+        )
+
+        return AmazonMantleConfig()
 
     # Handle provider-specific configs
     if bedrock_invoke_provider == "amazon":
@@ -596,14 +1082,54 @@ def get_bedrock_chat_config(model: str):
         return litellm.AmazonCohereConfig()
     elif bedrock_invoke_provider == "mistral":
         return litellm.AmazonMistralConfig()
+    elif bedrock_invoke_provider == "moonshot":
+        return litellm.AmazonMoonshotConfig()
     elif bedrock_invoke_provider == "deepseek_r1":
         return litellm.AmazonDeepSeekR1Config()
     elif bedrock_invoke_provider == "nova":
         return litellm.AmazonInvokeNovaConfig()
     elif bedrock_invoke_provider == "qwen3":
         return litellm.AmazonQwen3Config()
+    elif bedrock_invoke_provider == "qwen2":
+        return litellm.AmazonQwen2Config()
+    elif bedrock_invoke_provider == "twelvelabs":
+        return litellm.AmazonTwelveLabsPegasusConfig()
     else:
         return litellm.AmazonInvokeConfig()
+
+
+def _load_bedrock_response_stream_shape():
+    """
+    Load the ResponseStream shape from botocore's bundled bedrock-runtime schema.
+
+    Returns ``None`` if botocore is unavailable or the service model cannot be
+    loaded.
+    """
+    try:
+        from botocore.loaders import Loader
+        from botocore.model import ServiceModel
+
+        loader = Loader()
+        service_dict = loader.load_service_model("bedrock-runtime", "service-2")
+        return ServiceModel(service_dict).shape_for("ResponseStream")
+    except Exception as e:
+        verbose_logger.warning(
+            "litellm: could not load bedrock-runtime response stream shape "
+            "— Bedrock event-stream decoding will be unavailable. Error: %s",
+            e,
+        )
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def get_bedrock_response_stream_shape():
+    """
+    Lazily load and cache the bedrock-runtime ResponseStream shape for the process.
+
+    Avoids importing botocore (and logging warnings) unless Bedrock event-stream
+    decoding is actually needed.
+    """
+    return _load_bedrock_response_stream_shape()
 
 
 class BedrockEventStreamDecoderBase:
@@ -611,34 +1137,23 @@ class BedrockEventStreamDecoderBase:
     Base class for event stream decoding for Bedrock
     """
 
-    _response_stream_shape_cache = None
-
     def __init__(self):
         from botocore.parsers import EventStreamJSONParser
 
         self.parser = EventStreamJSONParser()
 
-    def get_response_stream_shape(self):
-        if self._response_stream_shape_cache is None:
-            from botocore.loaders import Loader
-            from botocore.model import ServiceModel
-
-            loader = Loader()
-            bedrock_service_dict = loader.load_service_model(
-                "bedrock-runtime", "service-2"
-            )
-            bedrock_service_model = ServiceModel(bedrock_service_dict)
-            self._response_stream_shape_cache = bedrock_service_model.shape_for(
-                "ResponseStream"
-            )
-
-        return self._response_stream_shape_cache
-
     def _parse_message_from_event(self, event) -> Optional[str]:
+        response_stream_shape = get_bedrock_response_stream_shape()
+        if response_stream_shape is None:
+            raise BedrockError(
+                status_code=500,
+                message=(
+                    "Bedrock event-stream shape could not be loaded from botocore. "
+                    "Ensure botocore is correctly installed."
+                ),
+            )
         response_dict = event.to_response_dict()
-        parsed_response = self.parser.parse(
-            response_dict, self.get_response_stream_shape()
-        )
+        parsed_response = self.parser.parse(response_dict, response_stream_shape)
 
         if response_dict["status_code"] != 200:
             decoded_body = response_dict["body"].decode()
@@ -674,7 +1189,7 @@ class BedrockEventStreamDecoderBase:
 def get_anthropic_beta_from_headers(headers: dict) -> List[str]:
     """
     Extract anthropic-beta header values and convert them to a list.
-    Supports comma-separated values from user headers.
+    Supports both JSON array format and comma-separated values from user headers.
 
     Used by both converse and invoke transformations for consistent handling
     of anthropic-beta headers that should be passed to AWS Bedrock.
@@ -689,8 +1204,27 @@ def get_anthropic_beta_from_headers(headers: dict) -> List[str]:
     if not anthropic_beta_header:
         return []
 
-    # Split comma-separated values and strip whitespace
-    return [beta.strip() for beta in anthropic_beta_header.split(",")]
+    # If it's already a list, return it
+    if isinstance(anthropic_beta_header, list):
+        return anthropic_beta_header
+
+    # Try to parse as JSON array first (e.g., '["interleaved-thinking-2025-05-14", "claude-code-20250219"]')
+    if isinstance(anthropic_beta_header, str):
+        anthropic_beta_header = anthropic_beta_header.strip()
+        if anthropic_beta_header.startswith("[") and anthropic_beta_header.endswith(
+            "]"
+        ):
+            try:
+                parsed = json.loads(anthropic_beta_header)
+                if isinstance(parsed, list):
+                    return [str(beta).strip() for beta in parsed]
+            except json.JSONDecodeError:
+                pass  # Fall through to comma-separated parsing
+
+        # Fall back to comma-separated values
+        return [beta.strip() for beta in anthropic_beta_header.split(",")]
+
+    return []
 
 
 class CommonBatchFilesUtils:
@@ -848,9 +1382,11 @@ class CommonBatchFilesUtils:
 
         return (
             dict(prepped.headers),
-            request_data.encode("utf-8")
-            if isinstance(request_data, str)
-            else request_data,
+            (
+                request_data.encode("utf-8")
+                if isinstance(request_data, str)
+                else request_data
+            ),
         )
 
     def generate_unique_job_name(self, model: str, prefix: str = "litellm") -> str:

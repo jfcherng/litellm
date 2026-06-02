@@ -45,3 +45,45 @@ def test_audit_log_masking():
     json_before_value = json.loads(audit_log.before_value)
     assert json_before_value["token"] == "1q2132r222"
     assert json_before_value["key"] == "sk-1*****7890"
+
+
+def test_internal_jobs_user_has_proxy_admin_role():
+    """
+    Test that the internal jobs system user has PROXY_ADMIN role.
+
+    This is critical for key rotation to work properly. The system user needs
+    PROXY_ADMIN role to bypass team permission checks in
+    TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint()
+
+    Regression test for: https://github.com/BerriAI/litellm/pull/21896
+    """
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+
+    # Get the system user used for internal jobs like key rotation
+    system_user = UserAPIKeyAuth.get_litellm_internal_jobs_user_api_key_auth()
+
+    # Verify the system user has PROXY_ADMIN role
+    assert system_user.user_role == LitellmUserRoles.PROXY_ADMIN
+
+    # Verify other expected properties
+    assert system_user.user_id == "system"
+    assert system_user.team_id == "system"
+    assert system_user.team_alias == "system"
+
+
+def test_user_api_key_auth_hashes_authorization_header_form_of_key():
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    raw_key = "sk-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    baseline = UserAPIKeyAuth(api_key=raw_key)
+
+    for header_form in (
+        f"Bearer {raw_key}",
+        f"bearer {raw_key}",
+        f"BEARER {raw_key}",
+        f"BeArEr {raw_key}",
+    ):
+        from_header = UserAPIKeyAuth(api_key=header_form)
+        assert from_header.api_key == baseline.api_key
+        assert from_header.token == baseline.token
+        assert not from_header.api_key.lower().startswith("bearer")

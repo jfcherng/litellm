@@ -401,7 +401,7 @@ class BaseLLMChatTest(ABC):
             {
                 "type": "file",
                 "file": {
-                    "file_id": "https://upload.wikimedia.org/wikipedia/commons/2/20/Re_example.pdf"
+                    "file_id": "https://cdn.jsdelivr.net/gh/BerriAI/litellm@d769e81c90d453240c61fc572cdb27fae06a89d0/tests/llm_translation/fixtures/dummy.pdf"
                 },
             },
         ]
@@ -853,8 +853,12 @@ class BaseLLMChatTest(ABC):
     @pytest.mark.parametrize(
         "image_url",
         [
-            "http://img1.etsystatic.com/260/0/7813604/il_fullxfull.4226713999_q86e.jpg",
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+            # In-repo logo served via jsdelivr (sha-pinned, immutable).
+            # Bedrock fetches the URL and base64-embeds it in the
+            # Converse request body; using a multi-MB hosted product
+            # photo here previously bloated cassettes to ~60 MB each.
+            "https://cdn.jsdelivr.net/gh/BerriAI/litellm@d769e81c90d453240c61fc572cdb27fae06a89d0/ui/litellm-dashboard/public/assets/logos/litellm_logo.jpg",
+            "https://awsmp-logos.s3.amazonaws.com/seller-xw5kijmvmzasy/c233c9ade2ccb5491072ae232c814942.png",
         ],
     )
     @pytest.mark.flaky(retries=4, delay=2)
@@ -868,8 +872,9 @@ class BaseLLMChatTest(ABC):
         base_completion_call_args = self.get_base_completion_call_args()
         if not supports_vision(base_completion_call_args["model"], None):
             pytest.skip("Model does not support image input")
-        elif "http://" in image_url and "fireworks_ai" in base_completion_call_args.get(
-            "model"
+        elif "http://" in image_url and (
+            "fireworks_ai" in base_completion_call_args.get("model", "")
+            or "mistral" in base_completion_call_args.get("model", "")
         ):
             pytest.skip("Model does not support http:// input")
 
@@ -920,7 +925,7 @@ class BaseLLMChatTest(ABC):
         os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
         litellm.model_cost = litellm.get_model_cost_map(url="")
 
-        image_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+        image_url = "https://awsmp-logos.s3.amazonaws.com/seller-xw5kijmvmzasy/c233c9ade2ccb5491072ae232c814942.png"
 
         base_completion_call_args = self.get_base_completion_call_args()
         if not supports_vision(base_completion_call_args["model"], None):
@@ -1062,7 +1067,7 @@ class BaseLLMChatTest(ABC):
         # Use local PDF file instead of external URL to avoid flaky tests
         test_dir = os.path.dirname(__file__)
         pdf_path = os.path.join(test_dir, "fixtures", "dummy.pdf")
-        
+
         with open(pdf_path, "rb") as f:
             file_data = f.read()
 

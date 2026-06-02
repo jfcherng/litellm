@@ -4,7 +4,7 @@ import pytest_asyncio
 from prometheus_client import REGISTRY
 
 try:
-    from litellm_enterprise.integrations.prometheus import PrometheusLogger
+    from litellm.integrations.prometheus import PrometheusLogger
 except Exception:
     PrometheusLogger = None
 
@@ -62,9 +62,11 @@ def prometheus_logger():
 
     with patch("litellm.proxy.proxy_server.premium_user", True):
         logger = PrometheusLogger()
+
         # Add the missing async_logging_hook method
         async def async_logging_hook(kwargs, result, call_type):
             return kwargs, result
+
         logger.async_logging_hook = async_logging_hook
         return logger
 
@@ -76,7 +78,7 @@ async def test_async_prometheus_success_logging_with_callbacks(prometheus_logger
     @compare_metrics
     async def op():
         await litellm.acompletion(
-            model="claude-3-haiku-20240307",
+            model="claude-haiku-4-5-20251001",
             messages=[{"role": "user", "content": "what llm are u"}],
             max_tokens=10,
             mock_response="hi",
@@ -101,9 +103,9 @@ async def test_async_prometheus_budget_logging_with_callbacks(prometheus_logger)
         router = litellm.Router(
             model_list=[
                 {
-                    "model_name": "gpt-3.5-turbo",
+                    "model_name": "gpt-5-mini",
                     "litellm_params": {
-                        "model": "openai/gpt-3.5-turbo",
+                        "model": "openai/gpt-5-mini",
                         "api_key": "mock-key",
                     },
                 }
@@ -112,7 +114,7 @@ async def test_async_prometheus_budget_logging_with_callbacks(prometheus_logger)
         )
 
         await router.acompletion(
-            model="gpt-3.5-turbo",
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": "llm?"}],
             mock_response="openai",
             metadata={
@@ -137,7 +139,7 @@ async def test_prometheus_metric_tracking():
     try:
         from unittest.mock import MagicMock
 
-        from litellm_enterprise.integrations.prometheus import PrometheusLogger
+        from litellm.integrations.prometheus import PrometheusLogger
     except Exception:
         PrometheusLogger = None
     if PrometheusLogger is None:
@@ -164,19 +166,19 @@ async def test_prometheus_metric_tracking():
     router = Router(
         model_list=[
             {
-                "model_name": "gpt-3.5-turbo",  # openai model name
+                "model_name": "gpt-5-mini",  # openai model name
                 "litellm_params": {  # params for litellm completion/embedding call
                     "model": "azure/gpt-4.1-mini",
-                    "api_key": os.getenv("AZURE_API_KEY"),
-                    "api_version": os.getenv("AZURE_API_VERSION"),
-                    "api_base": os.getenv("AZURE_API_BASE"),
+                    "api_key": os.getenv("AZURE_AI_API_KEY"),
+                    "api_version": os.getenv("AZURE_AI_API_VERSION"),
+                    "api_base": os.getenv("AZURE_AI_API_BASE"),
                 },
                 "model_info": {"id": "azure-model-id"},
             },
             {
-                "model_name": "gpt-3.5-turbo",  # openai model name
+                "model_name": "gpt-5-mini",  # openai model name
                 "litellm_params": {
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-5-mini",
                 },
                 "model_info": {"id": "openai-model-id"},
             },
@@ -190,7 +192,7 @@ async def test_prometheus_metric_tracking():
     try:
         response = await router.acompletion(
             messages=[{"role": "user", "content": "Hello, how are you?"}],
-            model="openai/gpt-4o-mini",
+            model="openai/gpt-5-mini",
             mock_response="hi",
         )
         print(response)
@@ -201,7 +203,6 @@ async def test_prometheus_metric_tracking():
 
     # Verify the mock was called correctly
     mock_prometheus.track_provider_remaining_budget.assert_called()
-
 
 
 class CustomPrometheusLogger(PrometheusLogger):
@@ -238,6 +239,7 @@ class CustomPrometheusLogger(PrometheusLogger):
 async def test_router_cooldown_event_callback():
     # Clear Prometheus registry to avoid duplicate metric registration
     from prometheus_client import REGISTRY
+
     collectors = list(REGISTRY._collector_to_names.keys())
     for collector in collectors:
         REGISTRY.unregister(collector)
@@ -250,8 +252,8 @@ async def test_router_cooldown_event_callback():
     # Mock Router instance
     mock_router = MagicMock()
     mock_deployment = {
-        "litellm_params": {"model": "gpt-3.5-turbo"},
-        "model_name": "gpt-3.5-turbo",
+        "litellm_params": {"model": "gpt-5-mini"},
+        "model_name": "gpt-5-mini",
         "model_info": ModelInfo(id="test-model-id"),
     }
     mock_router.get_deployment.return_value = mock_deployment
@@ -286,13 +288,13 @@ async def test_router_cooldown_event_callback():
     assert len(prometheus_logger.deployment_cooled_downs) == 1
 
     assert prometheus_logger.deployment_complete_outages[0] == [
-        "gpt-3.5-turbo",
+        "gpt-5-mini",
         "test-model-id",
         "https://api.openai.com",
         "openai",
     ]
     assert prometheus_logger.deployment_cooled_downs[0] == [
-        "gpt-3.5-turbo",
+        "gpt-5-mini",
         "test-model-id",
         "https://api.openai.com",
         "openai",
@@ -310,8 +312,8 @@ async def test_router_cooldown_event_callback_no_prometheus():
     # Mock Router instance
     mock_router = MagicMock()
     mock_deployment = {
-        "litellm_params": {"model": "gpt-3.5-turbo"},
-        "model_name": "gpt-3.5-turbo",
+        "litellm_params": {"model": "gpt-5-mini"},
+        "model_name": "gpt-5-mini",
         "model_info": ModelInfo(id="test-model-id"),
     }
     mock_router.get_deployment.return_value = mock_deployment
@@ -325,4 +327,3 @@ async def test_router_cooldown_event_callback_no_prometheus():
 
     # Assert that the router's get_deployment method was called
     mock_router.get_deployment.assert_called_once_with(model_id="test-deployment")
-

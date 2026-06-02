@@ -4,6 +4,7 @@
 This is an enterprise feature and requires a premium license.
 """
 
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import (
@@ -21,6 +22,7 @@ from typing_extensions import TypedDict
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import (
@@ -31,10 +33,13 @@ from litellm.proxy._types import (
     NewTeamRequest,
     NewUserRequest,
     NewUserResponse,
+    ProxyErrorTypes,
+    ProxyException,
     TeamMemberAddRequest,
     TeamMemberDeleteRequest,
     UserAPIKeyAuth,
 )
+from litellm.proxy.auth.auth_checks import _delete_cache_key_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.management_endpoints.internal_user_endpoints import new_user
 from litellm.proxy.management_endpoints.scim.scim_transformations import (
@@ -204,21 +209,63 @@ def _build_scim_metadata(
     return metadata
 
 
+async def _get_scim_upsert_user_setting() -> bool:
+    """
+    Get the scim_upsert_user setting from litellm_settings.
+
+    Returns:
+        True if scim_upsert_user is not set or is True (default behavior),
+        False if scim_upsert_user is explicitly set to False (SCIM 2.0 strict mode)
+    """
+    try:
+        from litellm.proxy.proxy_server import proxy_config
+
+        config = await proxy_config.get_config()
+        litellm_settings = config.get("litellm_settings", {}) or {}
+        scim_upsert_user = litellm_settings.get("scim_upsert_user", True)
+
+        # Default to True if not set (backward compatibility)
+        return bool(scim_upsert_user)
+    except Exception as e:
+        verbose_proxy_logger.warning(
+            f"Error reading scim_upsert_user setting, defaulting to True: {e}"
+        )
+        # Default to True for backward compatibility
+        return True
+
+
 async def _extract_group_member_ids(group: SCIMGroup) -> GroupMemberExtractionResult:
     """
-    Extract member IDs from SCIMGroup, creating users that don't exist.
+    Extract member IDs from SCIMGroup, validating that all users exist.
+
+    Behavior depends on litellm_settings.scim_upsert_user:
+    - If True (default): Creates users that don't exist (backward compatible)
+    - If False: Rejects non-existent users per SCIM 2.0 protocol
 
     Returns:
         GroupMemberExtractionResult with existing members, created users, and all member IDs
+
+    Raises:
+        HTTPException: If scim_upsert_user is False and any member user does not exist (400 Bad Request)
     """
     prisma_client = await _get_prisma_client_or_raise_exception()
     existing_member_ids = []
     created_users = []
     all_member_ids = []
 
+    # Check the feature flag
+    scim_upsert_user = await _get_scim_upsert_user_setting()
+
     if group.members:
         for member in group.members:
             user_id = member.value
+
+            # Validate user_id is not empty
+            if not user_id or not user_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Invalid member: user ID cannot be empty."},
+                )
 
             # Check if user exists
             user = await prisma_client.db.litellm_usertable.find_unique(
@@ -229,15 +276,26 @@ async def _extract_group_member_ids(group: SCIMGroup) -> GroupMemberExtractionRe
                 existing_member_ids.append(user_id)
                 all_member_ids.append(user_id)
             else:
-                # Create the user if they don't exist using our helper
-                created_user = await _create_user_if_not_exists(
-                    user_id=user_id, created_via="scim_group_membership"
-                )
-
-                if created_user:
-                    created_users.append(created_user)
-                    all_member_ids.append(user_id)
-                # If creation failed, user is skipped (logged in helper)
+                if scim_upsert_user:
+                    # Create the user if they don't exist (backward compatible behavior)
+                    created_user = await _create_user_if_not_exists(
+                        user_id=user_id, created_via="scim_group_membership"
+                    )
+                    if created_user:
+                        created_users.append(created_user)
+                        all_member_ids.append(user_id)
+                    # If creation failed, user is skipped (logged in helper)
+                else:
+                    # User doesn't exist - reject per SCIM 2.0 protocol
+                    # This prevents security issues where users not assigned to app
+                    # get provisioned via group membership
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": f"User with ID '{user_id}' does not exist. "
+                            "Please create the user first via POST /Users before adding to group."
+                        },
+                    )
 
     return GroupMemberExtractionResult(
         existing_member_ids=existing_member_ids,
@@ -278,6 +336,118 @@ async def _handle_team_membership_changes(
             teams_ids_to_add_user_to=list(teams_to_add),
             teams_ids_to_remove_user_from=list(teams_to_remove),
         )
+
+
+SCIM_BLOCKED_METADATA_KEY = "scim_blocked"
+
+
+def _key_was_scim_blocked(metadata: Any) -> bool:
+    """True if a verification token carries the SCIM-block marker in metadata."""
+    return (
+        isinstance(metadata, dict) and metadata.get(SCIM_BLOCKED_METADATA_KEY) is True
+    )
+
+
+async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
+    """
+    Block or unblock virtual keys owned by a user and invalidate them in the
+    in-memory/redis caches so the change takes effect immediately.
+
+    Each key SCIM blocks is tagged with ``metadata.scim_blocked = True``. On
+    reactivation we only unblock keys carrying that marker, so a key an admin
+    blocked manually for unrelated reasons is left alone.
+
+    Returns the number of keys whose state was flipped.
+    """
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    prisma_client = await _get_prisma_client_or_raise_exception()
+
+    if blocked:
+        # `blocked` is a nullable column with no default, so existing rows
+        # typically hold NULL; treat NULL as "not blocked" since SQL equality
+        # on NULL would otherwise silently skip them.
+        candidates = await prisma_client.db.litellm_verificationtoken.find_many(
+            where={
+                "user_id": user_id,
+                "OR": [{"blocked": False}, {"blocked": None}],
+            },
+        )
+        affected_keys = candidates
+    else:
+        candidates = await prisma_client.db.litellm_verificationtoken.find_many(
+            where={"user_id": user_id, "blocked": True},
+        )
+        affected_keys = [k for k in candidates if _key_was_scim_blocked(k.metadata)]
+
+    if not affected_keys:
+        return 0
+
+    for key_row in affected_keys:
+        current_metadata: Dict[str, Any] = (
+            dict(key_row.metadata) if isinstance(key_row.metadata, dict) else {}
+        )
+        if blocked:
+            new_metadata = {**current_metadata, SCIM_BLOCKED_METADATA_KEY: True}
+        else:
+            new_metadata = {
+                k: v
+                for k, v in current_metadata.items()
+                if k != SCIM_BLOCKED_METADATA_KEY
+            }
+        await prisma_client.db.litellm_verificationtoken.update(
+            where={"token": key_row.token},
+            data={"blocked": blocked, "metadata": safe_dumps(new_metadata)},
+        )
+
+    for key_row in affected_keys:
+        await _delete_cache_key_object(
+            hashed_token=key_row.token,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+    verbose_proxy_logger.info(
+        "SCIM: %s %d virtual key(s) for user_id=%s",
+        "blocked" if blocked else "unblocked",
+        len(affected_keys),
+        user_id,
+    )
+    return len(affected_keys)
+
+
+async def _delete_rows_referencing_user(prisma_client: Any, *, user_id: str) -> None:
+    """Drop rows whose foreign keys reference ``LiteLLM_UserTable.user_id``.
+
+    Required before deleting the user row itself, otherwise Postgres rejects
+    the user delete with an FK constraint violation (e.g.
+    ``LiteLLM_InvitationLink_user_id_fkey``).
+    """
+    await prisma_client.db.litellm_invitationlink.delete_many(
+        where={
+            "OR": [
+                {"user_id": user_id},
+                {"created_by": user_id},
+                {"updated_by": user_id},
+            ]
+        }
+    )
+    await prisma_client.db.litellm_organizationmembership.delete_many(
+        where={"user_id": user_id}
+    )
+    await prisma_client.db.litellm_teammembership.delete_many(
+        where={"user_id": user_id}
+    )
+
+
+def _scim_active_value(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Read the SCIM active flag from a user's metadata dict, if present."""
+    if not metadata:
+        return None
+    value = metadata.get("scim_active")
+    if value is None:
+        return None
+    return bool(value)
 
 
 async def _create_user_if_not_exists(
@@ -353,6 +523,306 @@ async def set_scim_content_type(response: Response):
     response.headers["Content-Type"] = "application/scim+json"
 
 
+def _get_resource_types(base_url: str = "/scim/v2") -> list:
+    """Return the list of SCIM ResourceType definitions per RFC 7643 Section 6."""
+    return [
+        SCIMResourceType(
+            id="User",
+            name="User",
+            description="User Account",
+            endpoint="/Users",
+            schema_="urn:ietf:params:scim:schemas:core:2.0:User",
+            meta={
+                "location": f"{base_url}/ResourceTypes/User",
+                "resourceType": "ResourceType",
+            },
+        ),
+        SCIMResourceType(
+            id="Group",
+            name="Group",
+            description="Group",
+            endpoint="/Groups",
+            schema_="urn:ietf:params:scim:schemas:core:2.0:Group",
+            meta={
+                "location": f"{base_url}/ResourceTypes/Group",
+                "resourceType": "ResourceType",
+            },
+        ),
+    ]
+
+
+def _get_schemas() -> list:
+    """Return the list of SCIM Schema definitions per RFC 7643 Section 7."""
+    return [
+        SCIMSchema(
+            id="urn:ietf:params:scim:schemas:core:2.0:User",
+            name="User",
+            description="User Account",
+            attributes=[
+                SCIMSchemaAttribute(
+                    name="userName",
+                    type="string",
+                    multiValued=False,
+                    description="Unique identifier for the User.",
+                    required=True,
+                    mutability="readWrite",
+                    returned="default",
+                    uniqueness="server",
+                ),
+                SCIMSchemaAttribute(
+                    name="name",
+                    type="complex",
+                    multiValued=False,
+                    description="The components of the user's real name.",
+                    required=False,
+                    subAttributes=[
+                        SCIMSchemaAttribute(
+                            name="givenName",
+                            type="string",
+                            description="The given name of the User.",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="familyName",
+                            type="string",
+                            description="The family name of the User.",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="formatted",
+                            type="string",
+                            description="The full name.",
+                        ),
+                    ],
+                ),
+                SCIMSchemaAttribute(
+                    name="displayName",
+                    type="string",
+                    multiValued=False,
+                    description="The name of the User, suitable for display.",
+                ),
+                SCIMSchemaAttribute(
+                    name="emails",
+                    type="complex",
+                    multiValued=True,
+                    description="Email addresses for the user.",
+                    subAttributes=[
+                        SCIMSchemaAttribute(
+                            name="value",
+                            type="string",
+                            description="Email address value.",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="type",
+                            type="string",
+                            description="Type of email (work, home, etc.).",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="primary",
+                            type="boolean",
+                            description="Whether this is the primary email.",
+                        ),
+                    ],
+                ),
+                SCIMSchemaAttribute(
+                    name="active",
+                    type="boolean",
+                    multiValued=False,
+                    description="Whether the user account is active.",
+                ),
+                SCIMSchemaAttribute(
+                    name="groups",
+                    type="complex",
+                    multiValued=True,
+                    description="Groups to which the user belongs.",
+                    mutability="readOnly",
+                    subAttributes=[
+                        SCIMSchemaAttribute(
+                            name="value",
+                            type="string",
+                            description="Group identifier.",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="display",
+                            type="string",
+                            description="Group display name.",
+                        ),
+                    ],
+                ),
+            ],
+            meta={
+                "location": "/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2.0:User",
+                "resourceType": "Schema",
+            },
+        ),
+        SCIMSchema(
+            id="urn:ietf:params:scim:schemas:core:2.0:Group",
+            name="Group",
+            description="Group",
+            attributes=[
+                SCIMSchemaAttribute(
+                    name="displayName",
+                    type="string",
+                    multiValued=False,
+                    description="A human-readable name for the Group.",
+                    required=True,
+                    mutability="readWrite",
+                    returned="default",
+                    uniqueness="none",
+                ),
+                SCIMSchemaAttribute(
+                    name="members",
+                    type="complex",
+                    multiValued=True,
+                    description="A list of members of the Group.",
+                    subAttributes=[
+                        SCIMSchemaAttribute(
+                            name="value",
+                            type="string",
+                            description="Member identifier.",
+                        ),
+                        SCIMSchemaAttribute(
+                            name="display",
+                            type="string",
+                            description="Member display name.",
+                        ),
+                    ],
+                ),
+            ],
+            meta={
+                "location": "/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group",
+                "resourceType": "Schema",
+            },
+        ),
+    ]
+
+
+@scim_router.get(
+    "",
+    status_code=200,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+@scim_router.get(
+    "/",
+    status_code=200,
+    include_in_schema=False,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+async def get_scim_base(request: Request):
+    """
+    Base SCIM v2 endpoint for resource discovery per RFC 7644 Section 4.
+
+    Returns a ListResponse of ResourceTypes supported by this SCIM service provider.
+    Identity providers (Okta, Azure AD, etc.) use this endpoint for resource discovery.
+    """
+    verbose_proxy_logger.debug(
+        "SCIM base resource discovery request: method=%s url=%s",
+        request.method,
+        request.url,
+    )
+    base_url = str(request.base_url).rstrip("/") + "/scim/v2"
+    resource_types = _get_resource_types(base_url)
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(resource_types),
+        "Resources": [rt.model_dump() for rt in resource_types],
+    }
+
+
+@scim_router.get(
+    "/ResourceTypes",
+    status_code=200,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+async def get_resource_types(request: Request):
+    """
+    SCIM ResourceTypes endpoint per RFC 7644 Section 4.
+
+    Returns a ListResponse of all resource types supported by this service provider.
+    """
+    verbose_proxy_logger.debug(
+        "SCIM ResourceTypes request: method=%s url=%s",
+        request.method,
+        request.url,
+    )
+    base_url = str(request.base_url).rstrip("/") + "/scim/v2"
+    resource_types = _get_resource_types(base_url)
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(resource_types),
+        "Resources": [rt.model_dump() for rt in resource_types],
+    }
+
+
+@scim_router.get(
+    "/ResourceTypes/{resource_type_id}",
+    status_code=200,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+async def get_resource_type(
+    request: Request,
+    resource_type_id: str = Path(..., title="ResourceType ID"),
+):
+    """
+    Get a single ResourceType by ID per RFC 7644.
+    """
+    verbose_proxy_logger.debug("SCIM ResourceType request for id=%s", resource_type_id)
+    base_url = str(request.base_url).rstrip("/") + "/scim/v2"
+    resource_types = _get_resource_types(base_url)
+    for rt in resource_types:
+        if rt.id == resource_type_id:
+            return rt.model_dump()
+    raise HTTPException(
+        status_code=404,
+        detail={"error": f"ResourceType not found: {resource_type_id}"},
+    )
+
+
+@scim_router.get(
+    "/Schemas",
+    status_code=200,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+async def get_schemas(request: Request):
+    """
+    SCIM Schemas endpoint per RFC 7643 Section 7.
+
+    Returns a ListResponse of all schemas supported by this service provider.
+    """
+    verbose_proxy_logger.debug(
+        "SCIM Schemas request: method=%s url=%s",
+        request.method,
+        request.url,
+    )
+    schemas = _get_schemas()
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(schemas),
+        "Resources": [s.model_dump() for s in schemas],
+    }
+
+
+@scim_router.get(
+    "/Schemas/{schema_id:path}",
+    status_code=200,
+    dependencies=[Depends(user_api_key_auth), Depends(set_scim_content_type)],
+)
+async def get_schema(
+    request: Request,
+    schema_id: str = Path(..., title="Schema URI"),
+):
+    """
+    Get a single Schema by its URI per RFC 7643 Section 7.
+    """
+    verbose_proxy_logger.debug("SCIM Schema request for id=%s", schema_id)
+    schemas = _get_schemas()
+    for s in schemas:
+        if s.id == schema_id:
+            return s.model_dump()
+    raise HTTPException(
+        status_code=404,
+        detail={"error": f"Schema not found: {schema_id}"},
+    )
+
+
 @scim_router.get(
     "/ServiceProviderConfig",
     response_model=SCIMServiceProviderConfig,
@@ -365,13 +835,25 @@ async def get_service_provider_config(request: Request):
         "SCIM ServiceProviderConfig request: method=%s url=%s headers=%s",
         request.method,
         request.url,
-        dict(request.headers),
+        _safe_get_request_headers(request),
     )
     meta = {
         "resourceType": "ServiceProviderConfig",
         "location": str(request.url),
     }
     return SCIMServiceProviderConfig(meta=meta)
+
+
+def _parse_scim_eq_filter(scim_filter: str) -> Optional[Tuple[str, str]]:
+    """Parse the SCIM equality filters Okta uses before user lifecycle changes."""
+    match = re.match(
+        r"""\s*([\w.]+)\s+eq\s+(['"]?)(.*?)\2\s*$""",
+        scim_filter,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).lower(), match.group(3)
 
 
 # User Endpoints
@@ -398,15 +880,21 @@ async def get_users(
     try:
         prisma_client = await _get_prisma_client_or_raise_exception()
         # Parse filter if provided (basic support)
-        where_conditions = {}
+        where_conditions: Dict[str, Any] = {}
         if filter:
-            # Very basic filter support - only handling userName eq and emails.value eq
-            if "userName eq" in filter:
-                user_id = filter.split("userName eq ")[1].strip("\"'")
-                where_conditions["user_id"] = user_id
-            elif "emails.value eq" in filter:
-                email = filter.split("emails.value eq ")[1].strip("\"'")
-                where_conditions["user_email"] = email
+            # Okta locates users by userName before deprovisioning. LiteLLM
+            # exposes SCIM userName from user_email, while older SCIM-created
+            # users may still have user_id == userName, so support both.
+            parsed_filter = _parse_scim_eq_filter(filter)
+            if parsed_filter:
+                filter_attribute, filter_value = parsed_filter
+                if filter_attribute == "username":
+                    where_conditions["OR"] = [
+                        {"user_email": filter_value},
+                        {"user_id": filter_value},
+                    ]
+                elif filter_attribute == "emails.value":
+                    where_conditions["user_email"] = filter_value
 
         # Get users from database
         users: List[LiteLLM_UserTable] = (
@@ -572,40 +1060,51 @@ async def update_user(
         prisma_client = await _get_prisma_client_or_raise_exception()
         existing_user = await _check_user_exists(user_id)
 
-        # Extract data from SCIM user
+        prev_active = _scim_active_value(existing_user.metadata)
+
         user_data = _extract_scim_user_data(user)
 
-        # Build metadata with SCIM data
-        metadata = _build_scim_metadata(
-            user_data["given_name"], user_data["family_name"], user_data["active"]
+        # SCIM PUT may legally omit `active` (full-replace with the field absent).
+        # Pydantic fills the model default, so distinguish "client sent active"
+        # from "client omitted it" via model_fields_set, and preserve the prior
+        # SCIM active state when omitted — otherwise a vanilla PUT to a
+        # deactivated user would silently re-enable them and unblock their keys.
+        client_set_active = "active" in user.model_fields_set
+        scim_active_for_metadata = (
+            user_data["active"] if client_set_active else prev_active
         )
 
-        # Handle team membership changes
+        metadata = _build_scim_metadata(
+            user_data["given_name"],
+            user_data["family_name"],
+            scim_active_for_metadata,
+        )
+
         await _handle_team_membership_changes(
             user_id=user_id,
             existing_teams=existing_user.teams or [],
             new_teams=user_data["teams"],
         )
 
-        # Update user with all new data (full replacement)
         update_data = {
             "user_email": user_data["user_email"],
             "user_alias": user_data["user_alias"],
             "sso_user_id": user_data["sso_user_id"],
             "teams": user_data["teams"],
-            "metadata": metadata,
+            "metadata": safe_dumps(metadata),
         }
-
-        # Serialize metadata to JSON string for Prisma to avoid GraphQL parsing issues
-        if "metadata" in update_data and isinstance(update_data["metadata"], dict):
-            from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
-
-            update_data["metadata"] = safe_dumps(update_data["metadata"])
 
         updated_user = await prisma_client.db.litellm_usertable.update(
             where={"user_id": user_id},
             data=update_data,
         )
+
+        if client_set_active:
+            new_active = _scim_active_value(metadata)
+            if new_active is not None and new_active != (
+                True if prev_active is None else prev_active
+            ):
+                await _set_user_keys_blocked(user_id=user_id, blocked=not new_active)
 
         # Convert back to SCIM format
         scim_user = await ScimTransformations.transform_litellm_user_to_scim_user(
@@ -652,6 +1151,10 @@ async def delete_user(
                 await prisma_client.db.litellm_teamtable.update(
                     where={"team_id": team.team_id}, data={"members": new_members}
                 )
+
+        await _set_user_keys_blocked(user_id=user_id, blocked=True)
+
+        await _delete_rows_referencing_user(prisma_client, user_id=user_id)
 
         # Delete user
         await prisma_client.db.litellm_usertable.delete(where={"user_id": user_id})
@@ -769,6 +1272,28 @@ def _apply_patch_ops(
         value = op.value
         op_type = op.op
 
+        # Handle SCIM operations without path where value contains the fields
+        if not path and isinstance(value, dict):
+            for key, val in value.items():
+                key_lower = key.lower()
+                if key_lower == "active":
+                    _handle_active_update(op_type, val, metadata)
+                elif key_lower == "displayname":
+                    _handle_displayname_update(op_type, val, update_data)
+                elif key_lower == "externalid":
+                    _handle_externalid_update(op_type, val, update_data)
+                elif key_lower == "name" and isinstance(val, dict):
+                    for name_key, name_val in val.items():
+                        name_key_lower = name_key.lower()
+                        if name_key_lower in ("givenname", "familyname"):
+                            _handle_name_update(
+                                f"name.{name_key_lower}",
+                                op_type,
+                                name_val,
+                                scim_metadata,
+                            )
+            continue
+
         if path == "displayname":
             _handle_displayname_update(op_type, value, update_data)
         elif path == "externalid":
@@ -797,6 +1322,9 @@ async def patch_team_membership(
 ) -> bool:
     """
     Add or remove user from teams
+
+    Handles duplicate membership gracefully (idempotent operation).
+    If a user is already in a team, that's fine - we don't treat it as an error.
     """
     for _team_id in teams_ids_to_add_user_to:
         try:
@@ -809,6 +1337,16 @@ async def patch_team_membership(
                     user_role=LitellmUserRoles.PROXY_ADMIN
                 ),
             )
+        except ProxyException as e:
+            # Handle duplicate membership gracefully - this is idempotent
+            if e.type == ProxyErrorTypes.team_member_already_in_team:
+                verbose_proxy_logger.debug(
+                    f"User {user_id} is already in team {_team_id}, skipping add"
+                )
+            else:
+                verbose_proxy_logger.exception(
+                    f"Error adding user to team {_team_id}: {e}"
+                )
         except Exception as e:
             verbose_proxy_logger.exception(f"Error adding user to team {_team_id}: {e}")
 
@@ -851,10 +1389,14 @@ async def patch_user(
         prisma_client = await _get_prisma_client_or_raise_exception()
         existing_user = await _check_user_exists(user_id)
 
+        prev_active = _scim_active_value(existing_user.metadata)
+
         update_data, final_team_set = _apply_patch_ops(
             existing_user=existing_user,
             patch_ops=patch_ops,
         )
+
+        new_active = _scim_active_value(update_data.get("metadata"))
 
         # Handle team membership changes
         await _handle_team_membership_changes(
@@ -875,6 +1417,11 @@ async def patch_user(
             where={"user_id": user_id},
             data=update_data,
         )
+
+        if new_active is not None and new_active != (
+            True if prev_active is None else prev_active
+        ):
+            await _set_user_keys_blocked(user_id=user_id, blocked=not new_active)
 
         scim_user = await ScimTransformations.transform_litellm_user_to_scim_user(
             updated_user
@@ -1024,7 +1571,7 @@ async def create_group(
                 detail={"error": f"Group already exists with ID: {team_id}"},
             )
 
-        # Extract and process group members (creating users that don't exist)
+        # Extract and validate group members (all users must exist)
         member_result = await _extract_group_member_ids(group)
         members_with_roles = [
             Member(user_id=member_id, role="user")
@@ -1072,7 +1619,7 @@ async def update_group(
         prisma_client = await _get_prisma_client_or_raise_exception()
         existing_team = await _check_team_exists(group_id)
 
-        # Extract and process group members (creating users that don't exist)
+        # Extract and validate group members (all users must exist)
         member_result = await _extract_group_member_ids(group)
         verbose_proxy_logger.debug(
             f"SCIM PUT GROUP all_member_ids: {member_result.all_member_ids}"
@@ -1189,23 +1736,41 @@ async def _process_group_patch_operations(
         elif path.startswith("members"):
             # Handle member operations
             member_values = _extract_group_values(value)
-            # Create users that don't exist and get all valid member IDs
+            # Check the feature flag
+            scim_upsert_user = await _get_scim_upsert_user_setting()
+            # Validate all users exist or create them based on feature flag
             valid_members = []
             for member_id in member_values:
+                # Validate member_id is not empty
+                if not member_id or not member_id.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "Invalid member: user ID cannot be empty."},
+                    )
+
                 user = await prisma_client.db.litellm_usertable.find_unique(
                     where={"user_id": member_id}
                 )
                 if user:
                     valid_members.append(member_id)
                 else:
-                    # Create the user if they don't exist using our helper
-                    created_user = await _create_user_if_not_exists(
-                        user_id=member_id, created_via="scim_group_patch"
-                    )
-
-                    if created_user:
-                        valid_members.append(member_id)
-                    # If creation failed, user is skipped (logged in helper)
+                    if scim_upsert_user:
+                        # Create the user if they don't exist (backward compatible behavior)
+                        created_user = await _create_user_if_not_exists(
+                            user_id=member_id, created_via="scim_group_patch"
+                        )
+                        if created_user:
+                            valid_members.append(member_id)
+                        # If creation failed, user is skipped (logged in helper)
+                    else:
+                        # User doesn't exist - reject per SCIM 2.0 protocol
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": f"User with ID '{member_id}' does not exist. "
+                                "Please create the user first via POST /Users before adding to group."
+                            },
+                        )
 
             if op_type == "replace":
                 final_members = set(valid_members)
@@ -1302,7 +1867,7 @@ async def patch_group(
             patch_ops, existing_team, prisma_client
         )
 
-        # Track current members for comparison
+        # Track current members BEFORE update for comparison
         current_members = set(await _get_team_member_user_ids_from_team(existing_team))
 
         # Apply updates to the database
@@ -1310,12 +1875,34 @@ async def patch_group(
             group_id, update_data, final_members, prisma_client
         )
 
+        # Refresh team data from database to get the latest state after concurrent updates
+        # This prevents race conditions when multiple PATCH requests come in simultaneously
+        refreshed_team = await prisma_client.db.litellm_teamtable.find_unique(
+            where={"team_id": group_id}
+        )
+        if refreshed_team:
+            # Re-read current members from refreshed team to account for concurrent updates
+            refreshed_current_members = set(
+                await _get_team_member_user_ids_from_team(
+                    LiteLLM_TeamTable(**refreshed_team.model_dump())
+                )
+            )
+            # Use the refreshed members for comparison
+            current_members = refreshed_current_members
+
         # Handle user-team relationship changes
         await _handle_group_membership_changes(group_id, current_members, final_members)
 
+        # Refresh team one more time to get final state after membership changes
+        final_team = await prisma_client.db.litellm_teamtable.find_unique(
+            where={"team_id": group_id}
+        )
+        if final_team:
+            updated_team = final_team
+
         # Convert to SCIM format and return
         scim_group = await ScimTransformations.transform_litellm_team_to_scim_group(
-            updated_team
+            LiteLLM_TeamTable(**updated_team.model_dump())
         )
         return scim_group
 
