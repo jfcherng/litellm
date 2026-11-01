@@ -3,11 +3,16 @@ Tests for BaseModelResponseIterator - specifically testing that empty SSE lines 
 and non-string objects (e.g. Pydantic BaseModel events from the Responses API) pass through.
 """
 
+import json
+
 import pytest
 from pydantic import BaseModel
 
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
-from litellm.types.utils import GenericStreamingChunk
+from litellm.llms.openai.chat.gpt_transformation import (
+    OpenAIChatCompletionStreamingHandler,
+)
+from litellm.types.utils import GenericStreamingChunk, ModelResponseStream
 
 
 class TestBaseModelResponseIterator:
@@ -256,3 +261,36 @@ async def test_aclose_is_noop_without_http_response():
     )
 
     await iterator.aclose()
+
+
+def _sse_line(delta: dict) -> str:
+    chunk = {
+        "id": "1",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    return "data: " + json.dumps(chunk)
+
+
+def test_payload_that_mentions_done_marker_is_not_the_end_of_stream():
+    content = 'if line == "data: [DONE]": break'
+    iterator = OpenAIChatCompletionStreamingHandler(
+        streaming_response=iter([_sse_line({"content": content})]), sync_stream=True
+    )
+
+    chunk = next(iterator)
+
+    assert isinstance(chunk, ModelResponseStream)
+    assert chunk.choices[0].delta.content == content
+
+
+@pytest.mark.parametrize("line", ["data: [DONE]", "data:[DONE]"])
+def test_done_marker_line_ends_the_stream(line):
+    iterator = OpenAIChatCompletionStreamingHandler(
+        streaming_response=iter([line]), sync_stream=True
+    )
+
+    chunk = next(iterator)
+
+    assert chunk["is_finished"] is True
+    assert chunk["finish_reason"] == "stop"
