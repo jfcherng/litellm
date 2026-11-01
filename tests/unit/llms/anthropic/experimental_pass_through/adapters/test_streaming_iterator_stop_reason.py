@@ -10,6 +10,8 @@ bridge emitted ``stop_reason: "end_turn"`` and Anthropic tool-runners
 (Claude Code, ``messages.stream``) silently dropped the tool call.
 """
 
+from typing import Final
+
 import pytest
 
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
@@ -77,3 +79,68 @@ def test_ollama_mid_stream_tool_call_yields_tool_use_stop_reason_sync():
 async def test_ollama_mid_stream_tool_call_yields_tool_use_stop_reason_async():
     wrapper = AnthropicStreamWrapper(completion_stream=_AsyncStream(_ollama_streamed_chunks()), model="qwen3:8b")
     _assert_tool_use_stop_reason([event async for event in wrapper])
+
+
+_CHUNK_BASE: Final = {"id": "chatcmpl-t", "object": "chat.completion.chunk", "created": 1, "model": "expert"}
+_TOOL_ARGUMENTS: Final = ('{"path": "/tmp/x.py", ', '"content": "hi"}')
+_USAGE: Final = {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+
+
+def _chunk(delta: dict[str, object], finish_reason: str | None = None) -> ModelResponseStream:
+    return ModelResponseStream(**_CHUNK_BASE, choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}])
+
+
+def _usage_chunk() -> ModelResponseStream:
+    return ModelResponseStream(**_CHUNK_BASE, choices=[], usage=_USAGE)
+
+
+def _arguments_chunk(arguments: str, finish_reason: str | None = None) -> ModelResponseStream:
+    return _chunk({"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]}, finish_reason)
+
+
+def _tool_call_opener() -> ModelResponseStream:
+    opener = {"index": 0, "id": "chatcmpl-tool-abc", "type": "function", "function": {"name": "write", "arguments": ""}}
+    return _chunk({"tool_calls": [opener]})
+
+
+def _events(chunks: list[ModelResponseStream]) -> list[dict]:
+    return list(AnthropicStreamWrapper(completion_stream=iter(chunks), model="expert"))
+
+
+def _stop_reason(events: list[dict]) -> str:
+    return [event for event in events if event["type"] == "message_delta"][-1]["delta"]["stop_reason"]
+
+
+def _tool_arguments(events: list[dict]) -> str:
+    return "".join(
+        event["delta"]["partial_json"]
+        for event in events
+        if event["type"] == "content_block_delta" and event["delta"]["type"] == "input_json_delta"
+    )
+
+
+def test_stop_finish_reason_after_tool_call_reports_tool_use():
+    chunks = [
+        _chunk({"role": "assistant"}),
+        _tool_call_opener(),
+        _arguments_chunk(_TOOL_ARGUMENTS[0]),
+        _arguments_chunk(_TOOL_ARGUMENTS[1], finish_reason="stop"),
+        _usage_chunk(),
+    ]
+
+    events = _events(chunks)
+
+    assert _tool_arguments(events) == "".join(_TOOL_ARGUMENTS)
+    assert _stop_reason(events) == "tool_use"
+
+
+def test_truncated_tool_call_keeps_max_tokens_stop_reason():
+    chunks = [
+        _chunk({"role": "assistant"}),
+        _tool_call_opener(),
+        _arguments_chunk(_TOOL_ARGUMENTS[0]),
+        _chunk({}, finish_reason="length"),
+        _usage_chunk(),
+    ]
+
+    assert _stop_reason(_events(chunks)) == "max_tokens"

@@ -427,6 +427,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     sent_first_chunk: bool = False
     sent_content_block_start: bool = False
     sent_content_block_finish: bool = False
+    saw_tool_use_block: bool = False
     current_content_block_type: Literal["text", "tool_use", "thinking"] = "text"
     sent_last_message: bool = False
     holding_chunk: ContentBlockDelta | None = None
@@ -507,6 +508,16 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             merged_chunk["context_management"] = ContextManagementResponse(applied_edits=list(self.applied_edits))
         return self._augment_message_delta_usage({**merged_chunk, "usage": usage_dict})
 
+    def _fix_tool_use_stop_reason(self, message_delta_chunk: MessageBlockDelta) -> MessageBlockDelta:
+        """Report ``tool_use`` when the turn emitted a tool call but the provider's last finish said ``stop``."""
+        delta: Final = message_delta_chunk.get("delta")
+        if not self.saw_tool_use_block or not isinstance(delta, dict) or delta.get("stop_reason") != "end_turn":
+            return message_delta_chunk
+        fixed_delta: Final[MessageDelta] = {**delta, "stop_reason": "tool_use"}
+        fixed: Final = message_delta_chunk.copy()
+        fixed["delta"] = fixed_delta
+        return fixed
+
     def _handle_choiceless_chunk(self, chunk: "ModelResponseStream") -> bool:
         """Consume an OpenAI-compatible chunk that carries no ``choices``.
 
@@ -549,7 +560,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         held-chunk flush path stays in sync with the merge path's guarantee
         when ``self.applied_edits`` is non-empty.
         """
-        message_delta_chunk = self._ensure_context_management_attached(message_delta_chunk)
+        message_delta_chunk = self._fix_tool_use_stop_reason(
+            self._ensure_context_management_attached(message_delta_chunk)
+        )
         if self.iterations_usage is None:
             return message_delta_chunk
         usage: Final = message_delta_chunk.get("usage")
@@ -1273,6 +1286,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         # Restore original tool name if it was truncated for OpenAI's 64-char limit
         if block_type == "tool_use":
+            self.saw_tool_use_block = True
             # Type narrowing: content_block_start is ToolUseBlock when block_type is "tool_use"
             from typing import cast
 
