@@ -1,3 +1,4 @@
+.codegraph/
 .python-version
 .venv
 tests/e2e/.fixtures/
